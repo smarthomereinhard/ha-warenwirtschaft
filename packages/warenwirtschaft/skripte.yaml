@@ -1,0 +1,948 @@
+# ==============================================================================
+# Warenwirtschaft – Skripte
+#   wws_buchen              zentrale Buchung (alle Eingänge rufen nur dieses Skript)
+#   wws_bestand_setzen      ändert genau eine Bestandszeile (intern)
+#   wws_scan                verarbeitet einen gescannten Code (CMD-/LO-/Artikel)
+#   wws_csv_import          CSV der App „Barcode Scanner: Inventur CSV“
+#   wws_dashboard_buchen    Formular im Dashboard
+#   wws_kassenzettel_einbuchen  Positionen eines Kassenzettels (optional)
+#   wws_unbekannt           unbekannten Barcode bei OpenFoodFacts klären
+#   wws_packungswechsel     Brücke für Spezialvorräte (Milch, Kaffee …)
+#   wws_kurzmeldung         kurze Bestätigung für Befehls-/Lagerort-Scans
+#   wws_ansage              Sprachausgabe (an dein TTS anpassen)
+#   wws_stammdaten_neu_laden
+# ==============================================================================
+script:
+  wws_buchen:
+    alias: "WWS – Buchen"
+    description: >-
+      Zentrale Buchung. Löst Zusatz-EANs und LO-Codes auf, wählt den Lagerort,
+      rechnet Packungswechsel/Angebrochen, ändert den Bestand über
+      script.wws_bestand_setzen, feuert das Ereignis vorrat_gebucht und schreibt
+      (außer im Testmodus) in die Google-Tabelle. Gefriergut (Code GG-…) hat nie
+      einen Mindestbestand. Zeilen im virtuellen Lagerort „Abgelaufen“ zählen nicht
+      zum Bestand. Getränke mit Standard-Lagerort Kühlschrank landen beim Einbuchen
+      ab 6 Stück (Kiste) in der Vorratskammer.
+    icon: mdi:barcode-scan
+    mode: queued
+    max: 50
+    fields:
+      code:
+        name: Barcode / Artikel-Nr.
+        required: true
+        selector:
+          text: {}
+      art:
+        name: Buchungsart
+        required: true
+        default: entnehmen
+        selector:
+          select:
+            options: [einbuchen, entnehmen, leer, muell, umbuchen, inventur]
+      anzahl:
+        name: Anzahl
+        default: 1
+        selector:
+          number: {min: 0, max: 999, mode: box}
+      lagerort:
+        name: Lagerort (bei Umbuchen Ziel)
+        description: Name oder LO-Code. Leer = Standard-Lagerort bzw. automatisch.
+        selector:
+          text: {}
+      von:
+        name: Von Lagerort (nur Umbuchen)
+        selector:
+          text: {}
+      quelle:
+        name: Quelle
+        default: manuell
+        selector:
+          text: {}
+    sequence:
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          e: >-
+            {% set s = states.sensor.wws_stammdaten.attributes %}{% set roh = code | string | trim %}{% set haupt = ((s.weitere_eans or {}).get(roh, roh)) | string %}{% set a = (s.artikel or {}).get(haupt) %}{% set codes = s.codes or {} %}{% set lo = (lagerort | default('', true)) | string | trim %}{% set vo = (von | default('', true)) | string | trim %}{{ {'code': haupt, 'bekannt': a is not none, 'name': a[0] if a else 'Unbekannt (' ~ haupt ~ ')', 'marke': a[1] if a else '', 'std': (a[2] if a and a[2] else 'Eingang'), 'mind': (a[3] | int(0)) if a and not haupt.startswith('GG-') else 0, 'angebrochen': ((a[4] | int(0)) == 1) if a else false, 'sammel': (a[6] if a else ''), 'zaehlart': (a[7] if a else 'Stück'), 'gruppe': (a[8] if a and a | count > 8 else ''), 'ort': codes.get(lo, lo), 'von': codes.get(vo, vo), 'art': (art | string | lower | trim), 'anzahl': [anzahl | default(1) | int(1), 0] | max, 'quelle': (quelle | default('manuell', true) | string)} }}
+          zeilen: >-
+            {% set art_s = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set ns = namespace(z=[]) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if d.code is defined %}{% set c = d.code | string %}{% set ns.z = ns.z + [{'code': c, 'ort': d.ort | default(''), 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'sammel': (art_s.get(c) or ['', '', '', 0, 0, 0, ''])[6]}] %}{% endif %}{% endfor %}{{ ns.z }}
+      - variables:
+          p: >-
+            {% set z = zeilen %}{% set n = e.anzahl %}{% set ziel = e.ort if e.art == 'umbuchen' else '' %}{% set wunsch = e.von if e.art == 'umbuchen' else e.ort %}{% set eig = z | selectattr('code', 'eq', e.code) | list %}{% set mit = eig | selectattr('stk', 'gt', 0) | rejectattr('ort', 'eq', ziel) | list %}{% set q1 = (mit | selectattr('ort', 'eq', wunsch) | list) if wunsch else [] %}{% set q2 = mit | selectattr('ort', 'eq', e.std) | list %}{% set q3 = mit | sort(attribute='stk') | list %}{% set quelle = (q1 or q2 or q3 or [none]) | first %}{% set qort = quelle.ort if quelle else '' %}{% set off_eig = eig | selectattr('offen', 'gt', 0) | list %}{% set off_ort = off_eig | selectattr('ort', 'eq', qort or wunsch or e.std) | list %}{% set off_sam = (z | selectattr('sammel', 'eq', e.sammel) | selectattr('offen', 'gt', 0) | list) if e.sammel else [] %}{% set offrow = (off_ort or off_eig or off_sam or [none]) | first %}{% set ns = namespace(ops=[], notiz='', ort='') %}{% if e.art == 'einbuchen' %}{% set gebinde = e.gruppe == 'Getränke' and e.std == 'Kühlschrank' and n >= 6 %}{% set o = 'Eingang' if not e.bekannt else (e.ort or ('Vorratskammer' if gebinde else e.std)) %}{% set ns.ops = [{'code': e.code, 'ort': o, 'dstk': n, 'doffen': 0}] %}{% set ns.ort = o %}{% if not e.bekannt %}{% set ns.notiz = 'Unbekannter Artikel – im Eingang' %}{% endif %}{% elif e.art == 'inventur' %}{% set o = 'Eingang' if not e.bekannt else (e.ort or e.std) %}{% set ns.ops = [{'code': e.code, 'ort': o, 'dstk': 0, 'doffen': 0, 'setze': n}] %}{% set ns.ort = o %}{% if not e.bekannt %}{% set ns.notiz = 'Unbekannter Artikel – im Eingang' %}{% endif %}{% elif e.art == 'entnehmen' %}{% if quelle %}{% set ns.ort = qort %}{% if e.angebrochen %}{% if offrow %}{% set ns.ops = [{'code': offrow.code, 'ort': offrow.ort, 'dstk': 0, 'doffen': -1}] %}{% set ns.notiz = 'Packungswechsel' %}{% endif %}{% set ns.ops = ns.ops + [{'code': e.code, 'ort': qort, 'dstk': -n, 'doffen': 1}] %}{% else %}{% set ns.ops = [{'code': e.code, 'ort': qort, 'dstk': -n, 'doffen': 0}] %}{% endif %}{% else %}{% set ns.ort = e.ort or e.std %}{% set ns.notiz = 'Kein Bestand erfasst' %}{% if e.angebrochen %}{% if offrow %}{% set ns.ops = [{'code': offrow.code, 'ort': offrow.ort, 'dstk': 0, 'doffen': -1}] %}{% endif %}{% set ns.ops = ns.ops + [{'code': e.code, 'ort': ns.ort, 'dstk': 0, 'doffen': 1}] %}{% endif %}{% endif %}{% elif e.art in ['leer', 'muell'] %}{% set rest = n %}{% if offrow %}{% set ns.ops = [{'code': offrow.code, 'ort': offrow.ort, 'dstk': 0, 'doffen': -1}] %}{% set ns.ort = offrow.ort %}{% set rest = n - 1 %}{% endif %}{% if rest > 0 and quelle %}{% set ns.ops = ns.ops + [{'code': e.code, 'ort': qort, 'dstk': -rest, 'doffen': 0}] %}{% set ns.ort = ns.ort or qort %}{% endif %}{% if not ns.ops %}{% set ns.notiz = 'Kein Bestand erfasst' %}{% endif %}{% elif e.art == 'umbuchen' %}{% if not ziel %}{% set ns.notiz = 'Kein Zielort' %}{% elif quelle %}{% set m = [n, quelle.stk] | min %}{% set ns.ops = [{'code': e.code, 'ort': qort, 'dstk': -m, 'doffen': 0}, {'code': e.code, 'ort': ziel, 'dstk': m, 'doffen': 0}] %}{% set ns.ort = qort ~ ' → ' ~ ziel %}{% else %}{% set ns.notiz = 'Kein Bestand zum Umbuchen' %}{% endif %}{% else %}{% set ns.notiz = 'Unbekannte Buchungsart' %}{% endif %}{{ {'ops': ns.ops, 'notiz': ns.notiz, 'ort': ns.ort} }}
+      - alias: Bestandszeilen ändern
+        repeat:
+          for_each: "{{ p.ops }}"
+          sequence:
+            - action: script.wws_bestand_setzen
+              data:
+                code: "{{ repeat.item.code }}"
+                ort: "{{ repeat.item.ort }}"
+                delta_stk: "{{ repeat.item.dstk }}"
+                delta_offen: "{{ repeat.item.doffen }}"
+                setze_stk: "{{ repeat.item.setze if repeat.item.setze is defined else none }}"
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste2
+      - variables:
+          testmodus: "{{ is_state('input_boolean.wws_testmodus', 'on') }}"
+          nach: >-
+            {% set art_s = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set ns = namespace(z=[], rows=[]) %}{% for it in liste2['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if d.code is defined %}{% set c = d.code | string %}{% set ns.z = ns.z + [{'code': c, 'ort': d.ort | default(''), 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'offen_seit': d.offen_seit | default(''), 'mhd': d.mhd | default(''), 'sammel': (art_s.get(c) or ['', '', '', 0, 0, 0, ''])[6]}] %}{% endif %}{% endfor %}{% set aktiv = ns.z | rejectattr('ort', 'eq', 'Abgelaufen') | list %}{% set eig = aktiv | selectattr('code', 'eq', e.code) | list %}{% set sam = (aktiv | selectattr('sammel', 'eq', e.sammel) | list) if e.sammel else eig %}{% for op in p.ops %}{% set f = ns.z | selectattr('code', 'eq', op.code) | selectattr('ort', 'eq', op.ort) | list %}{% set r = (f | first) if f else {'code': op.code, 'ort': op.ort, 'stk': 0, 'offen': 0, 'offen_seit': '', 'mhd': ''} %}{% set r = dict(r, name=(art_s.get(op.code) or ['Unbekannt (' ~ op.code ~ ')'])[0]) %}{% if r not in ns.rows %}{% set ns.rows = ns.rows + [r] %}{% endif %}{% endfor %}{{ {'gesamt': eig | sum(attribute='stk'), 'offen': eig | sum(attribute='offen'), 'sammel_gesamt': sam | sum(attribute='stk'), 'sammel_offen': sam | sum(attribute='offen'), 'rows': ns.rows} }}
+      - event: vorrat_gebucht
+        event_data:
+          art: "{{ e.art }}"
+          code: "{{ e.code }}"
+          name: "{{ e.name }}"
+          marke: "{{ e.marke }}"
+          bekannt: "{{ e.bekannt }}"
+          ort: "{{ p.ort }}"
+          anzahl: "{{ e.anzahl }}"
+          stk: "{{ nach.gesamt }}"
+          offen: "{{ nach.offen }}"
+          sammel: "{{ e.sammel }}"
+          gesamt: "{{ nach.sammel_gesamt }}"
+          mind: "{{ (state_attr('sensor.wws_stammdaten', 'sammel') or {}).get(e.sammel, [e.mind])[0] if e.sammel else e.mind }}"
+          notiz: "{{ p.notiz }}"
+          quelle: "{{ e.quelle }}"
+          testmodus: "{{ testmodus }}"
+      - alias: Google-Tabelle (nicht im Testmodus)
+        if:
+          - condition: state
+            entity_id: input_boolean.wws_testmodus
+            state: "off"
+        then:
+          - action: shell_command.wws_senden
+            continue_on_error: true
+            data:
+              daten: "{{ {'action': 'buchung', 'art': e.art, 'quelle': e.quelle, 'code': e.code, 'name': e.name, 'lagerort': p.ort, 'anzahl': e.anzahl, 'bestand_danach': nach.gesamt, 'notiz': p.notiz} }}"
+            response_variable: antwort
+          - repeat:
+              for_each: "{{ nach.rows }}"
+              sequence:
+                - action: shell_command.wws_senden
+                  continue_on_error: true
+                  data:
+                    daten: "{{ {'action': 'bestand', 'code': repeat.item.code, 'name': repeat.item.name, 'lagerort': repeat.item.ort, 'stueck': repeat.item.stk, 'offen': repeat.item.offen, 'offen_seit': repeat.item.offen_seit, 'haltbar_bis': repeat.item.mhd} }}"
+          - if:
+              - condition: template
+                value_template: "{{ antwort is not defined or '\"ok\"' not in (antwort.stdout | default('')) }}"
+            then:
+              - action: persistent_notification.create
+                data:
+                  notification_id: wws_sheet_fehler
+                  title: "Warenwirtschaft: Sheet nicht erreichbar"
+                  message: "Buchung {{ e.art }} {{ e.name }} ({{ e.code }}) wurde in HA gebucht, aber nicht ins Google Sheet geschrieben. {{ antwort.stderr | default('') if antwort is defined else '' }}"
+      - variables:
+          ergebnis: "{{ {'ok': (p.ops | count) > 0, 'art': e.art, 'code': e.code, 'name': e.name, 'marke': e.marke, 'bekannt': e.bekannt, 'ort': p.ort, 'anzahl': e.anzahl, 'stk': nach.gesamt, 'offen': nach.offen, 'sammel': e.sammel, 'sammel_gesamt': nach.sammel_gesamt, 'notiz': p.notiz, 'testmodus': testmodus, 'zeilen': nach.rows} }}"
+      - stop: fertig
+        response_variable: ergebnis
+
+  wws_bestand_setzen:
+    alias: "WWS – Bestand setzen (intern)"
+    description: >-
+      Ändert genau eine Bestandszeile (Artikel + Lagerort) in
+      todo.warenwirtschaft_bestand: anlegen, ändern oder bei 0 Stück und 0 offen
+      entfernen. Gibt den neuen Stand zurück und feuert wws_bestand_geaendert.
+      Normalerweise nur von script.wws_buchen aufrufen.
+    icon: mdi:database-edit
+    mode: queued
+    max: 50
+    fields:
+      code:
+        name: Artikel-Nr.
+        required: true
+        selector:
+          text: {}
+      ort:
+        name: Lagerort
+        required: true
+        selector:
+          text: {}
+      delta_stk:
+        name: Änderung Stück
+        default: 0
+        selector:
+          number: {min: -999, max: 999, mode: box}
+      delta_offen:
+        name: Änderung offen
+        default: 0
+        selector:
+          number: {min: -99, max: 99, mode: box}
+      setze_stk:
+        name: Stück fest setzen (Inventur)
+        selector:
+          number: {min: 0, max: 9999, mode: box}
+    sequence:
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          stamm: "{{ (state_attr('sensor.wws_stammdaten', 'artikel') or {}).get(code | string | trim) }}"
+          treffer: >-
+            {% set ns = namespace(t=none) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if (d.code | default('') | string) == (code | string | trim) and d.ort | default('') == (ort | string | trim) %}{% set ns.t = {'uid': it.uid, 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'offen_seit': d.offen_seit | default(''), 'mhd': d.mhd | default('')} %}{% endif %}{% endfor %}{{ ns.t }}
+      - variables:
+          name: "{{ stamm[0] if stamm else 'Unbekannt (' ~ (code | string | trim) ~ ')' }}"
+          marke: "{{ stamm[1] if stamm else '' }}"
+          alt_stk: "{{ treffer.stk if treffer else 0 }}"
+          alt_offen: "{{ treffer.offen if treffer else 0 }}"
+          neu_stk: >-
+            {% if setze_stk is defined and setze_stk is not none and setze_stk != '' %}{{ [setze_stk | int(0), 0] | max }}{% else %}{{ [(treffer.stk if treffer else 0) + (delta_stk | default(0) | int(0)), 0] | max }}{% endif %}
+          neu_offen: "{{ [(treffer.offen if treffer else 0) + (delta_offen | default(0) | int(0)), 0] | max }}"
+      - variables:
+          offen_seit: >-
+            {% if neu_offen | int == 0 %}-{% elif (delta_offen | default(0) | int(0)) > 0 %}{{ now().date().isoformat() }}{% else %}{{ (treffer.offen_seit if treffer else '') or '-' }}{% endif %}
+          zusammenfassung: "{{ neu_stk }}× {{ name }}{{ ' – ' ~ marke if marke else '' }} · {{ ort | string | trim }}{{ ' · ' ~ neu_offen ~ ' offen' if neu_offen | int > 0 else '' }}"
+      - variables:
+          beschreibung: "{{ {'code': (code | string | trim), 'ort': (ort | string | trim), 'stk': neu_stk | int, 'offen': neu_offen | int, 'offen_seit': ('' if offen_seit == '-' else offen_seit | string), 'mhd': ((treffer.mhd if treffer else '') | string)} | tojson }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ treffer and neu_stk | int == 0 and neu_offen | int == 0 }}"
+            sequence:
+              - action: todo.remove_item
+                target:
+                  entity_id: todo.warenwirtschaft_bestand
+                data:
+                  item: "{{ treffer.uid }}"
+          - conditions:
+              - condition: template
+                value_template: "{{ treffer is mapping }}"
+            sequence:
+              - action: todo.update_item
+                target:
+                  entity_id: todo.warenwirtschaft_bestand
+                data:
+                  item: "{{ treffer.uid }}"
+                  rename: "{{ zusammenfassung }}"
+                  description: "{{ beschreibung | string }}"
+          - conditions:
+              - condition: template
+                value_template: "{{ neu_stk | int > 0 or neu_offen | int > 0 }}"
+            sequence:
+              - action: todo.add_item
+                target:
+                  entity_id: todo.warenwirtschaft_bestand
+                data:
+                  item: "{{ zusammenfassung }}"
+                  description: "{{ beschreibung | string }}"
+      - alias: Übersicht neu rechnen lassen
+        event: wws_bestand_geaendert
+        event_data:
+          code: "{{ code | string | trim }}"
+          ort: "{{ ort | string | trim }}"
+      - variables:
+          ergebnis: "{{ {'code': (code | string | trim), 'ort': (ort | string | trim), 'name': name, 'marke': marke, 'alt_stk': alt_stk | int, 'stk': neu_stk | int, 'alt_offen': alt_offen | int, 'offen': neu_offen | int} }}"
+      - stop: fertig
+        response_variable: ergebnis
+
+  wws_scan:
+    alias: "WWS – Scan verarbeiten"
+    description: >-
+      Nimmt einen gescannten Code von jedem Eingang an (Webhook, Kurzbefehl, NFC,
+      Hardware-Scanner). CMD-Codes setzen den Modus, LO-Codes den Lagerort – beides
+      gilt 10 Minuten (timer.wws_scan_sitzung) für die folgenden Artikel. Artikel
+      werden über script.wws_buchen gebucht. Ohne Sitzung zählt ein Artikel-Scan
+      als 1 Stück entnommen. Ausdrücklich übergebene art/lagerort haben Vorrang.
+    icon: mdi:barcode-scan
+    mode: queued
+    max: 50
+    fields:
+      code:
+        name: Gescannter Code
+        required: true
+        selector:
+          text: {}
+      art:
+        name: Buchungsart (optional)
+        selector:
+          select:
+            options: [einbuchen, entnehmen, leer, muell, umbuchen, inventur]
+      lagerort:
+        name: Lagerort (optional)
+        selector:
+          text: {}
+      anzahl:
+        name: Anzahl
+        default: 1
+        selector:
+          number: {min: 0, max: 999, mode: box}
+      quelle:
+        name: Quelle
+        default: scan
+        selector:
+          text: {}
+    sequence:
+      - variables:
+          befehle:
+            CMD-AUS: entnehmen
+            CMD-EIN: einbuchen
+            CMD-INV: inventur
+            CMD-LEER: leer
+            CMD-MUELL: muell
+            CMD-UM: umbuchen
+          k: "{% set c = code | string | trim %}{{ {'c': c, 'gross': c | upper} }}"
+      - choose:
+          - alias: Befehl Fertig – Sitzung beenden
+            conditions:
+              - condition: template
+                value_template: "{{ k.gross == 'CMD-ENDE' }}"
+            sequence:
+              - action: timer.cancel
+                target:
+                  entity_id: timer.wws_scan_sitzung
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.wws_scan_modus
+                data:
+                  option: entnehmen
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.wws_scan_lagerort
+                data:
+                  value: ""
+              - variables:
+                  r: "{{ {'typ': 'befehl', 'modus': 'entnehmen', 'ort': '', 'text': 'Sitzung beendet'} }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ (quelle | default('scan')) != 'nfc' }}"
+                then:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.wws_kurzmeldung
+                    data:
+                      variables:
+                        text: "Scan-Sitzung beendet, Master."
+              - stop: Sitzung beendet
+                response_variable: r
+          - alias: Befehl – Modus setzen
+            conditions:
+              - condition: template
+                value_template: "{{ k.gross in befehle }}"
+            sequence:
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.wws_scan_modus
+                data:
+                  option: "{{ befehle[k.gross] }}"
+              - action: timer.start
+                target:
+                  entity_id: timer.wws_scan_sitzung
+              - variables:
+                  r: "{{ {'typ': 'befehl', 'modus': befehle[k.gross], 'ort': states('input_text.wws_scan_lagerort'), 'text': 'Modus ' ~ befehle[k.gross]} }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ (quelle | default('scan')) != 'nfc' }}"
+                then:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.wws_kurzmeldung
+                    data:
+                      variables:
+                        text: >-
+                          {% set lab = {'entnehmen': 'Entnehmen', 'einbuchen': 'Einbuchen', 'umbuchen': 'Umbuchen', 'inventur': 'Inventur', 'muell': 'Müll', 'leer': 'Leer'} %}Modus {{ lab[befehle[k.gross]] }}{{ ', Lagerort ' ~ states('input_text.wws_scan_lagerort') if states('input_text.wws_scan_lagerort') else '' }}.
+              - stop: Modus gesetzt
+                response_variable: r
+          - alias: Lagerort-Code
+            conditions:
+              - condition: template
+                value_template: "{{ k.gross.startswith('LO-') }}"
+            sequence:
+              - variables:
+                  ortname: "{{ (state_attr('sensor.wws_stammdaten', 'codes') or {}).get(k.gross, '') }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ ortname == '' }}"
+                then:
+                  - variables:
+                      r: "{{ {'typ': 'fehler', 'text': 'Unbekannter Lagerort-Code ' ~ k.c} }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ (quelle | default('scan')) != 'nfc' }}"
+                    then:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.wws_kurzmeldung
+                        data:
+                          variables:
+                            text: "Verzeihung, Master. Den Lagerort-Code {{ k.c }} kenne ich nicht."
+                  - stop: Unbekannter Lagerort
+                    response_variable: r
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.wws_scan_lagerort
+                data:
+                  value: "{{ ortname }}"
+              - action: timer.start
+                target:
+                  entity_id: timer.wws_scan_sitzung
+              - variables:
+                  r: "{{ {'typ': 'ort', 'modus': states('input_select.wws_scan_modus'), 'ort': ortname, 'text': 'Lagerort ' ~ ortname} }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ (quelle | default('scan')) != 'nfc' }}"
+                then:
+                  - action: script.turn_on
+                    target:
+                      entity_id: script.wws_kurzmeldung
+                    data:
+                      variables:
+                        text: >-
+                          {% set lab = {'entnehmen': 'Entnehmen', 'einbuchen': 'Einbuchen', 'umbuchen': 'Umbuchen', 'inventur': 'Inventur', 'muell': 'Müll', 'leer': 'Leer'} %}Lagerort {{ ortname }}, Modus {{ lab.get(states('input_select.wws_scan_modus'), states('input_select.wws_scan_modus')) }}.
+              - stop: Lagerort gesetzt
+                response_variable: r
+      - variables:
+          art_eff: "{{ art if art is defined and art not in [none, ''] else (states('input_select.wws_scan_modus') if is_state('timer.wws_scan_sitzung', 'active') else 'entnehmen') }}"
+          ort_eff: "{{ lagerort if lagerort is defined and lagerort not in [none, ''] else (states('input_text.wws_scan_lagerort') if is_state('timer.wws_scan_sitzung', 'active') else '') }}"
+      - alias: "Live-Inventur: erster Scan setzt 1, weitere +1"
+        variables:
+          live_inv: "{{ art_eff == 'inventur' and not (art is defined and art not in [none, '']) }}"
+          inv_key: "{{ k.c ~ '|' ~ ort_eff }}"
+          art_final: >-
+            {% if art_eff == 'inventur' and not (art is defined and art not in [none, '']) and (k.c ~ '|' ~ ort_eff) in (state_attr('sensor.wws_inventur_sitzung', 'gezaehlt') or []) %}einbuchen{% else %}{{ art_eff }}{% endif %}
+      - action: script.wws_buchen
+        data:
+          code: "{{ k.c }}"
+          art: "{{ art_final }}"
+          anzahl: "{{ anzahl | default(1) }}"
+          lagerort: "{{ ort_eff }}"
+          quelle: "{{ quelle | default('scan') }}"
+        response_variable: r
+      - if:
+          - condition: template
+            value_template: "{{ live_inv }}"
+        then:
+          - event: wws_inventur_gezaehlt
+            event_data:
+              key: "{{ inv_key }}"
+      - alias: Sitzung verlängern
+        if:
+          - condition: state
+            entity_id: timer.wws_scan_sitzung
+            state: active
+        then:
+          - action: timer.start
+            target:
+              entity_id: timer.wws_scan_sitzung
+      - variables:
+          antwort: "{{ dict(r, typ='artikel') }}"
+      - stop: gebucht
+        response_variable: antwort
+
+  wws_csv_import:
+    alias: "WWS – CSV-Import (Inventur-App)"
+    description: >-
+      Importiert die CSV der App „Barcode Scanner: Inventur CSV“ (Spalten Datum und
+      Uhrzeit,Format,Wert,Menge,…). Eine LO-Zeile setzt den Lagerort für alle
+      folgenden Zeilen; Artikel vor dem ersten LO bekommen rückwirkend den ersten
+      Lagerort. CMD-INV bzw. CMD-EIN in der CSV bestimmt die Buchungsart. Scans
+      werden je Artikel+Lagerort summiert und über script.wws_buchen gebucht. Bei
+      Inventur werden nicht gescannte Artikel eines gezählten Orts nur gemeldet,
+      nicht genullt. Unbekannte Artikel werden still über script.wws_unbekannt
+      geklärt; eine einzige Telegram-Rückmeldung mit Zahlen.
+    icon: mdi:file-delimited
+    mode: queued
+    max: 5
+    fields:
+      csv:
+        name: CSV-Inhalt
+        required: true
+        selector:
+          text: {multiline: true}
+      art:
+        name: Buchungsart
+        default: inventur
+        selector:
+          select:
+            options: [inventur, einbuchen]
+      lagerort:
+        name: Lagerort für Zeilen vor dem ersten LO-Code
+        selector:
+          text: {}
+      quelle:
+        name: Quelle
+        default: inventur-app
+        selector:
+          text: {}
+    sequence:
+      - variables:
+          modus: >-
+            {% set c = (csv | default('') | string | upper) %}{% if ',CMD-INV,' in c %}inventur{% elif ',CMD-EIN,' in c %}einbuchen{% else %}{{ 'einbuchen' if (art | default('inventur', true)) == 'einbuchen' else 'inventur' }}{% endif %}
+          posten: >-
+            {% set s = states.sensor.wws_stammdaten.attributes %}{% set codes = s.codes or {} %}{% set eans = s.weitere_eans or {} %}{% set start = (lagerort | default('', true)) | string | trim %}{% set ns = namespace(ort=codes.get(start | upper, start), erster='', roh=[]) %}{% for zeile in (csv | string).replace('\r', '\n').split('\n') %}{% set f = zeile.split(',') %}{% if f | count >= 3 %}{% set w = f[2] | replace('"', '') | trim %}{% set m = (f[3] | replace('"', '') | trim | int(1)) if f | count > 3 else 1 %}{% if w == '' or w == 'Wert' or (w | upper).startswith('CMD-') %}{% elif (w | upper).startswith('LO-') %}{% set ns.ort = codes.get(w | upper, ns.ort) %}{% if ns.erster == '' %}{% set ns.erster = ns.ort %}{% endif %}{% else %}{% set ns.roh = ns.roh + [{'code': eans.get(w, w) | string, 'ort': ns.ort, 'm': m}] %}{% endif %}{% endif %}{% endfor %}{% set nk = namespace(keys=[], roh=[]) %}{% for r in ns.roh %}{% set o = r.ort if r.ort else ns.erster %}{% set key = r.code ~ '|' ~ o %}{% set nk.roh = nk.roh + [{'k': key, 'code': r.code, 'ort': o, 'm': r.m}] %}{% if key not in nk.keys %}{% set nk.keys = nk.keys + [key] %}{% endif %}{% endfor %}{% set ns2 = namespace(p=[]) %}{% for key in nk.keys %}{% set g = nk.roh | selectattr('k', 'eq', key) | list %}{% set ns2.p = ns2.p + [{'code': g[0].code, 'ort': g[0].ort, 'anzahl': g | sum(attribute='m')}] %}{% endfor %}{{ ns2.p }}
+      - if:
+          - condition: template
+            value_template: "{{ posten | count == 0 }}"
+        then:
+          - variables:
+              r: "{{ {'ok': false, 'text': 'Keine Artikel in der CSV gefunden.'} }}"
+          - stop: leer
+            response_variable: r
+      - alias: Alle Posten buchen
+        repeat:
+          for_each: "{{ posten }}"
+          sequence:
+            - action: script.wws_buchen
+              continue_on_error: true
+              data:
+                code: "{{ repeat.item.code }}"
+                art: "{{ modus }}"
+                anzahl: "{{ repeat.item.anzahl }}"
+                lagerort: "{{ repeat.item.ort }}"
+                quelle: "{{ quelle | default('inventur-app', true) }}"
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          bericht: >-
+            {% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set ns = namespace(keys=[], fehlt=[]) %}{% for p in posten %}{% set ns.keys = ns.keys + [(p.code | string) ~ '|' ~ p.ort] %}{% endfor %}{% set orte = posten | map(attribute='ort') | reject('eq', '') | unique | list %}{% if modus == 'inventur' %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if d.ort is defined and d.ort in orte and ((d.code | string) ~ '|' ~ d.ort) not in ns.keys %}{% set ns.fehlt = ns.fehlt + [{'code': d.code | string, 'ort': d.ort, 'name': (a.get(d.code | string) or ['Unbekannt'])[0], 'stk': d.stk | int(0)}] %}{% endif %}{% endfor %}{% endif %}{% set unbek = posten | map(attribute='code') | map('string') | reject('in', a.keys() | list) | unique | list %}{{ {'ok': true, 'modus': modus, 'posten': posten | count, 'stueck': posten | sum(attribute='anzahl'), 'orte': orte, 'unbekannt': unbek, 'nicht_gezaehlt': ns.fehlt} }}
+          geklaert: "{{ [] }}"
+      - alias: Unbekannte Artikel über OpenFoodFacts klären
+        if:
+          - condition: template
+            value_template: "{{ bericht.unbekannt | count > 0 }}"
+        then:
+          - repeat:
+              for_each: "{{ bericht.unbekannt }}"
+              sequence:
+                - action: script.wws_unbekannt
+                  continue_on_error: true
+                  data:
+                    code: "{{ repeat.item }}"
+                    ort: "{% set p = posten | selectattr('code', 'eq', repeat.item | string) | list %}{{ p[0].ort if p and p[0].ort else 'Eingang' }}"
+                    still: true
+                  response_variable: u
+                - variables:
+                    geklaert: "{{ geklaert + [u if (u is defined and u is mapping and (u.code | default('') | string) == (repeat.item | string)) else {'code': repeat.item | string, 'gefunden': false, 'name': '', 'marke': '', 'groesse': '', 'angelegt': false}] }}"
+      - alias: Rückmeldung per Telegram – nur Zahlen
+        action: telegram_bot.send_message
+        continue_on_error: true
+        data:
+          chat_id: !secret wws_telegram_chat_id
+          config_entry_id: !secret wws_telegram_config_entry_id
+          parse_mode: html
+          message: |-
+            {% set gef = geklaert | selectattr('gefunden') | list %}{% set offen = geklaert | rejectattr('gefunden') | list %}{{ '🧪 Test – ' if is_state('input_boolean.wws_testmodus', 'on') else '' }}🤖 Master, {{ 'Inventur' if bericht.modus == 'inventur' else 'Wareneingang' }}{{ ' ' ~ bericht.orte | join(', ') if bericht.orte else '' }} verbucht: <b>{{ bericht.posten }} Artikel, {{ bericht.stueck }} Stück</b>.{% if gef %}
+            🔎 {{ gef | count }} davon neu erkannt und angelegt.{% endif %}{% if bericht.nicht_gezaehlt %}
+            ⚠️ {{ bericht.nicht_gezaehlt | count }} Artikel stehen noch im Bestand, wurden aber nicht gescannt.{% endif %}{% if offen %}
+            ❓ {{ offen | count }} kenne ich nicht (im Eingang) – bitte je Artikel <code>/artikel EAN Name – Marke</code>:
+            {% for x in offen %}• <code>{{ x.code }}</code>
+            {% endfor %}{% endif %}
+      - action: persistent_notification.create
+        data:
+          notification_id: wws_csv_import
+          title: "Warenwirtschaft: CSV-Import ({{ bericht.modus }})"
+          message: |-
+            {{ bericht.posten }} Artikel ({{ bericht.stueck }} Stück) gebucht{% if bericht.orte %} – {{ bericht.orte | join(', ') }}{% endif %}.{% if bericht.unbekannt %}
+
+            Unbekannt gescannt: {{ bericht.unbekannt | join(', ') }} – per OpenFoodFacts geprüft.{% endif %}{% if bericht.nicht_gezaehlt %}
+
+            Nicht gezählt (noch im Bestand, NICHT genullt):
+            {% for x in bericht.nicht_gezaehlt %}- {{ x.stk }}× {{ x.name }} · {{ x.ort }}
+            {% endfor %}{% endif %}
+      - stop: fertig
+        response_variable: bericht
+
+  wws_dashboard_buchen:
+    alias: "WWS – Buchen aus dem Dashboard"
+    description: >-
+      Liest das Formular im Dashboard (Barcode oder Name, Buchungsart, Anzahl,
+      Lagerort) und bucht über script.wws_buchen. Statt eines Barcodes darf auch ein
+      Teil des Artikelnamens stehen (erster Treffer). Ergebnis steht danach in
+      input_text.wws_letzte_ruckmeldung.
+    icon: mdi:gesture-tap-button
+    mode: queued
+    max: 10
+    sequence:
+      - variables:
+          k: >-
+            {% set roh = states('input_text.wws_eingabe_barcode') | trim %}{% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set ns = namespace(c='') %}{% if roh in a or roh | regex_match('^[0-9]{6,14}$') %}{% set ns.c = roh %}{% else %}{% for c, v in a.items() if ns.c == '' and roh | length > 2 and (roh | lower) in ((v[0] ~ ' ' ~ v[1]) | lower) %}{% set ns.c = c %}{% endfor %}{% endif %}{{ {'c': ns.c, 'roh': roh} }}
+          ort: "{{ '' if is_state('input_select.wws_eingabe_lagerort', 'automatisch') else states('input_select.wws_eingabe_lagerort') }}"
+      - if:
+          - condition: template
+            value_template: "{{ k.c == '' }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.wws_letzte_ruckmeldung
+            data:
+              value: "❌ Nichts gefunden für „{{ k.roh }}“"
+          - stop: nicht gefunden
+      - action: script.wws_buchen
+        data:
+          code: "{{ k.c }}"
+          art: "{{ states('input_select.wws_eingabe_buchungsart') }}"
+          anzahl: "{{ states('input_number.wws_eingabe_anzahl') | int(1) }}"
+          lagerort: "{{ ort }}"
+          quelle: dashboard
+        response_variable: r
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.wws_letzte_ruckmeldung
+        data:
+          value: "{{ ('✅ ' if r.ok else '⚠️ ') ~ r.art ~ ': ' ~ r.name ~ (' – ' ~ r.marke if r.marke else '') ~ ' · ' ~ r.ort ~ ' · jetzt ' ~ r.stk ~ ' Stück' ~ (' + ' ~ r.offen ~ ' offen' if r.offen | int(0) > 0 else '') ~ (' · ' ~ r.notiz if r.notiz else '') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.wws_eingabe_barcode
+        data:
+          value: ""
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.wws_eingabe_anzahl
+        data:
+          value: 1
+
+  wws_kassenzettel_einbuchen:
+    alias: "WWS – Kassenzettel einbuchen"
+    description: >-
+      Bucht die Positionen eines Kassenzettels ein. positionen = Liste von
+      {name, marke (optional), anzahl, ean (optional)}. Zuordnung: EAN, sonst Name
+      (enthalten in/enthält Artikelname; bei mehreren Treffern gewinnt die passende
+      Marke, dann der längste Name). Nicht zugeordnete Posten werden nur gemeldet.
+      Gedacht für eine eigene Kassenzettel-Auswertung (z. B. per KI aus einem Foto).
+    icon: mdi:receipt-text-check
+    mode: queued
+    max: 5
+    fields:
+      positionen:
+        name: Positionen
+        required: true
+        selector:
+          object: {}
+      laden:
+        name: Laden
+        selector:
+          text: {}
+    sequence:
+      - variables:
+          zuordnung: >-
+            {% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set eans = state_attr('sensor.wws_stammdaten', 'weitere_eans') or {} %}{% set ns = namespace(ok=[], offen=[]) %}{% for pos in (positionen if positionen is list else []) %}{% set n = (pos.name | default('') | string | lower | replace(' ', '')) %}{% set mk = (pos.marke | default('') | string | lower | replace(' ', '')) %}{% set e = (pos.ean | default('') | string | trim) %}{% set e = eans.get(e, e) %}{% set m = namespace(c='', score=0) %}{% if e and e in a %}{% set m.c = e %}{% else %}{% for c, v in a.items() %}{% set an = v[0] | lower | replace(' ', '') %}{% set am = v[1] | lower | replace(' ', '') %}{% if an | length > 3 and n | length > 3 and (an in n or n in an) %}{% set s = (an | length) + (100 if mk and am and (am in mk or mk in am) else 0) + (50 if am and am in n else 0) %}{% if s > m.score %}{% set m.score = s %}{% set m.c = c %}{% endif %}{% endif %}{% endfor %}{% endif %}{% if m.c %}{% set ns.ok = ns.ok + [{'code': m.c, 'anzahl': [pos.anzahl | default(1) | int(1), 1] | max, 'name': a[m.c][0]}] %}{% else %}{% set ns.offen = ns.offen + [pos.name | default('?')] %}{% endif %}{% endfor %}{{ {'ok': ns.ok, 'offen': ns.offen} }}
+      - repeat:
+          for_each: "{{ zuordnung.ok }}"
+          sequence:
+            - action: script.wws_buchen
+              continue_on_error: true
+              data:
+                code: "{{ repeat.item.code }}"
+                art: einbuchen
+                anzahl: "{{ repeat.item.anzahl }}"
+                quelle: kassenzettel
+      - action: telegram_bot.send_message
+        continue_on_error: true
+        data:
+          chat_id: !secret wws_telegram_chat_id
+          config_entry_id: !secret wws_telegram_config_entry_id
+          parse_mode: html
+          message: |-
+            {{ '🧪 Test · ' if is_state('input_boolean.wws_testmodus', 'on') else '' }}🤖 Master, der Einkauf{{ ' bei ' ~ laden if laden is defined and laden else '' }} ist eingebucht.
+            📥 <b>{{ zuordnung.ok | count }}</b> Artikel:
+            {% for x in zuordnung.ok %}• {{ x.anzahl }}× {{ x.name }}
+            {% endfor %}{% if zuordnung.offen %}
+            ❓ Nicht zugeordnet (bitte bei Bedarf scannen):
+            {% for x in zuordnung.offen %}• {{ x }}
+            {% endfor %}{% endif %}
+      - variables:
+          r: "{{ zuordnung }}"
+      - stop: fertig
+        response_variable: r
+
+  wws_unbekannt:
+    alias: "WWS – Unbekannten Artikel klären"
+    description: >-
+      Sucht einen unbekannten Barcode bei OpenFoodFacts/OpenBeautyFacts/
+      OpenProductsFacts. Gefunden: Artikel wird (außer im Testmodus) im Artikelstamm
+      angelegt (Notiz „prüfen“), Stammdaten neu geladen und an den gescannten
+      Lagerort gebucht. Nicht gefunden: Nachfrage per Telegram – Antwort mit
+      /artikel <EAN> Name – Marke. Mit still: true keine Einzelmeldung; Rückgabe
+      {code, gefunden, name, marke, groesse, angelegt}.
+    icon: mdi:help-box
+    mode: queued
+    max: 10
+    fields:
+      code:
+        name: Barcode
+        required: true
+        selector:
+          text: {}
+      ort:
+        name: Gescannter Lagerort
+        default: Eingang
+        selector:
+          text: {}
+      still:
+        name: Still (ohne Einzelmeldung)
+        default: false
+        selector:
+          boolean: {}
+    sequence:
+      - variables:
+          k: "{{ {'c': code | string | trim, 'ort': (ort | default('Eingang', true) | string)} }}"
+          test: "{{ is_state('input_boolean.wws_testmodus', 'on') }}"
+      - action: shell_command.wws_off
+        continue_on_error: true
+        data:
+          code: "{{ k.c }}"
+        response_variable: "off"
+      - variables:
+          p: >-
+            {% set j = (off.stdout | default('{}')) | from_json(default={}) %}{% set pr = j.product | default({}) %}{% set name = (pr.product_name_de | default('', true)) or (pr.product_name | default('', true)) %}{{ {'gefunden': (j.status | default(0) | int(0)) == 1 and name != '', 'name': name | trim, 'marke': ((pr.brands | default('')).split(',')[0]) | trim, 'groesse': pr.quantity | default('') | trim, 'kat': ((pr.categories | default('')).split(',') | last) | trim} }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ p.gefunden }}"
+            sequence:
+              - if:
+                  - condition: state
+                    entity_id: input_boolean.wws_testmodus
+                    state: "off"
+                then:
+                  - action: shell_command.wws_senden
+                    continue_on_error: true
+                    data:
+                      daten: "{{ {'action': 'artikel_neu', 'code': k.c, 'name': p.name, 'marke': p.marke, 'groesse': p.groesse, 'lagerort': k.ort, 'notiz': 'neu von OpenFoodFacts (' ~ p.kat ~ ') – prüfen'} }}"
+                  - event: wws_stammdaten_laden
+                  - wait_template: "{{ k.c in (state_attr('sensor.wws_stammdaten', 'artikel') or {}) }}"
+                    timeout: "00:01:30"
+                    continue_on_timeout: true
+                  - action: script.wws_bestand_setzen
+                    continue_on_error: true
+                    data:
+                      code: "{{ k.c }}"
+                      ort: Eingang
+                      delta_stk: 0
+                  - alias: Vom Eingang an den gescannten Lagerort umbuchen
+                    if:
+                      - condition: template
+                        value_template: "{{ k.ort not in ['', 'Eingang'] }}"
+                    then:
+                      - action: script.wws_buchen
+                        continue_on_error: true
+                        data:
+                          code: "{{ k.c }}"
+                          art: umbuchen
+                          von: Eingang
+                          lagerort: "{{ k.ort }}"
+                          anzahl: 999
+                          quelle: unbekannt-geklaert
+              - alias: Einzelmeldung nur ohne still
+                if:
+                  - condition: template
+                    value_template: "{{ not (still | default(false)) }}"
+                then:
+                  - action: telegram_bot.send_message
+                    continue_on_error: true
+                    data:
+                      chat_id: !secret wws_telegram_chat_id
+                      config_entry_id: !secret wws_telegram_config_entry_id
+                      parse_mode: html
+                      message: |-
+                        {{ '🧪 Test – ' if test else '' }}🤖 Master, ein neuer Artikel ist eingetroffen.
+                        🏷️ <b>{{ p.name }}</b>{{ ' – ' ~ p.marke if p.marke else '' }}{{ ' (' ~ p.groesse ~ ')' if p.groesse else '' }}
+                        🔎 gefunden bei OpenFoodFacts · <code>{{ k.c }}</code>
+                        📦 liegt vorerst im <b>{{ k.ort }}</b>
+                        {{ 'Ich habe ihn im Artikelstamm angelegt – bitte bei Gelegenheit Warengruppe, Lagerort und Mindestbestand prüfen.' if not test else 'Im Testmodus lege ich ihn noch nicht im Artikelstamm an.' }}
+        default:
+          - alias: Einzelmeldung/Ansage nur ohne still
+            if:
+              - condition: template
+                value_template: "{{ not (still | default(false)) }}"
+            then:
+              - action: telegram_bot.send_message
+                continue_on_error: true
+                data:
+                  chat_id: !secret wws_telegram_chat_id
+                  config_entry_id: !secret wws_telegram_config_entry_id
+                  parse_mode: html
+                  message: |-
+                    {{ '🧪 Test – ' if test else '' }}🤖 Verzeihung, Master – diesen Artikel kenne ich nicht.
+                    ❓ Barcode <code>{{ k.c }}</code>, liegt vorerst im <b>Eingang</b>.
+                    Antworten Sie bitte mit <code>/artikel {{ k.c }} Name – Marke</code>,
+                    dann merke ich ihn mir dauerhaft.
+              - if:
+                  - condition: state
+                    entity_id: input_boolean.jemand_zuhause
+                    state: "on"
+                  - condition: state
+                    entity_id: input_boolean.warenwirtschaft_ansagen
+                    state: "on"
+                  - condition: state
+                    entity_id: input_boolean.wws_testmodus
+                    state: "off"
+                then:
+                  - action: script.wws_ansage
+                    continue_on_error: true
+                    data:
+                      message: "Verzeihung, Master. Diesen Artikel kenne ich nicht. Ich habe Ihnen eine Nachricht geschickt."
+      - variables:
+          ergebnis: "{{ {'code': k.c, 'gefunden': p.gefunden, 'name': p.name, 'marke': p.marke, 'groesse': p.groesse, 'angelegt': p.gefunden and not test} }}"
+      - stop: fertig
+        response_variable: ergebnis
+
+  wws_packungswechsel:
+    alias: "WWS – Packungswechsel (Spezialvorräte)"
+    description: >-
+      Brücke für Vorräte mit eigener Logik (z. B. Milch in ml, Kaffee in Gramm,
+      Tabs). Diese melden hier nur, dass eine neue Packung angebrochen wurde. Sucht
+      den Artikel (EAN-Hinweis → gleicher Sammelartikel → Suchbegriff im Namen) mit
+      Bestand und bucht „entnehmen“ (bei angebrochenen Artikeln = Packungswechsel:
+      alte offene Packung zu, neue auf). Optional ort_offen: die neu angebrochene
+      Packung wird danach dorthin umgebucht (z. B. Milch → Kühlschrank).
+    icon: mdi:package-variant-closed-plus
+    mode: queued
+    max: 10
+    fields:
+      code:
+        name: EAN-Hinweis
+        description: EAN der angebrochenen Packung, falls bekannt
+        selector:
+          text: {}
+      suche:
+        name: Suchbegriffe
+        description: Teil von Artikel- oder Sammelname, mehrere mit | trennen (z. B. kaffeebohnen)
+        selector:
+          text: {}
+      ort_offen:
+        name: Lagerort der offenen Packung
+        description: Wohin die neu angebrochene Packung kommt (z. B. Kühlschrank). Leer = bleibt am Entnahme-Ort.
+        selector:
+          text: {}
+      quelle:
+        name: Quelle
+        default: packungswechsel
+        selector:
+          text: {}
+    sequence:
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          wahl: >-
+            {% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set eans = state_attr('sensor.wws_stammdaten', 'weitere_eans') or {} %}{% set h0 = code | default('', true) | string | trim %}{% set h = eans.get(h0, h0) | string %}{% set such = (suche | default('', true) | string | lower).split('|') | map('trim') | reject('eq', '') | list %}{% set sam = a[h][6] if h in a else '' %}{% set ns = namespace(m=[]) %}{% for c, v in a.items() %}{% set n = (v[0] ~ ' ' ~ v[6]) | lower %}{% if c == h or (sam and v[6] == sam) or (such and (such | select('in', n) | list | count) > 0) %}{% set ns.m = ns.m + [c] %}{% endif %}{% endfor %}{% set r = namespace(z=[]) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if d.code is defined and (d.code | string) in ns.m %}{% set r.z = r.z + [{'code': d.code | string, 'stk': d.stk | int(0)}] %}{% endif %}{% endfor %}{% set mit = r.z | selectattr('stk', 'gt', 0) | list %}{% set eig = mit | selectattr('code', 'eq', h) | list %}{% set best = (eig or (mit | sort(attribute='stk', reverse=true) | list) or [none]) | first %}{{ best.code if best else (h if h in a else (ns.m | first if ns.m else '')) }}
+      - if:
+          - condition: template
+            value_template: "{{ wahl | string | length == 0 }}"
+        then:
+          - variables:
+              r: "{{ {'ok': false, 'notiz': 'Kein passender Artikel in der Warenwirtschaft'} }}"
+          - stop: kein Artikel
+            response_variable: r
+      - action: script.wws_buchen
+        data:
+          code: "{{ wahl }}"
+          art: entnehmen
+          anzahl: 1
+          quelle: "{{ quelle | default('packungswechsel', true) }}"
+        response_variable: r
+      - alias: Neu angebrochene Packung an ihren Platz umbuchen
+        if:
+          - condition: template
+            value_template: "{{ (ort_offen | default('', true) | string | length) > 0 and r.ok | default(false) and (r.ort | default('') | string) not in ['', ort_offen | string] }}"
+        then:
+          - action: script.wws_bestand_setzen
+            data:
+              code: "{{ r.code }}"
+              ort: "{{ r.ort }}"
+              delta_stk: 0
+              delta_offen: -1
+          - action: script.wws_bestand_setzen
+            data:
+              code: "{{ r.code }}"
+              ort: "{{ ort_offen }}"
+              delta_stk: 0
+              delta_offen: 1
+      - stop: fertig
+        response_variable: r
+
+  wws_kurzmeldung:
+    alias: "WWS – Kurzmeldung (Scan-Sitzung)"
+    description: >-
+      Kurze Bestätigung für Befehls- und Lagerort-Scans. Testmodus: Telegram mit 🧪.
+      Sonst: jemand zu Hause + Ansagen an → Sprachausgabe, sonst Telegram.
+    icon: mdi:message-flash
+    mode: queued
+    max: 10
+    fields:
+      text:
+        name: Text
+        required: true
+        selector:
+          text: {}
+    sequence:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.wws_testmodus
+                state: "on"
+            sequence:
+              - action: telegram_bot.send_message
+                continue_on_error: true
+                data:
+                  chat_id: !secret wws_telegram_chat_id
+                  config_entry_id: !secret wws_telegram_config_entry_id
+                  disable_notification: true
+                  message: "🧪 Test · 🏷️ {{ text }}"
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.warenwirtschaft_ansagen
+                state: "on"
+              - condition: state
+                entity_id: input_boolean.jemand_zuhause
+                state: "on"
+            sequence:
+              - action: script.wws_ansage
+                continue_on_error: true
+                data:
+                  message: "{{ text }}"
+        default:
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data:
+              chat_id: !secret wws_telegram_chat_id
+              config_entry_id: !secret wws_telegram_config_entry_id
+              disable_notification: true
+              message: "🤖 🏷️ {{ text }}"
+
+  wws_ansage:
+    alias: "WWS – Ansage (an dein TTS anpassen)"
+    description: >-
+      Sprachausgabe der Warenwirtschaft. Passe tts.DEIN_TTS und
+      media_player.DEIN_LAUTSPRECHER an – oder ruf hier dein eigenes Ansage-Skript auf.
+    icon: mdi:account-voice
+    mode: queued
+    max: 10
+    fields:
+      message:
+        name: Text
+        required: true
+        selector:
+          text: {}
+    sequence:
+      - action: tts.speak
+        continue_on_error: true
+        target:
+          entity_id: tts.DEIN_TTS
+        data:
+          media_player_entity_id: media_player.DEIN_LAUTSPRECHER
+          message: "{{ message }}"
+
+  wws_stammdaten_neu_laden:
+    alias: "WWS – Stammdaten neu laden"
+    description: Lädt den Artikelstamm sofort aus der Google-Tabelle (sonst nachts 03:40 und beim Start).
+    icon: mdi:database-refresh
+    mode: single
+    sequence:
+      - event: wws_stammdaten_laden

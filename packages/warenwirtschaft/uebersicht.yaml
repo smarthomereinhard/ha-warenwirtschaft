@@ -1,0 +1,91 @@
+# ==============================================================================
+# Warenwirtschaft – Übersicht für Dashboard und Meldungen
+# Liest todo.warenwirtschaft_bestand nach jeder Buchung neu und rechnet Kennzahlen:
+# offene Packungen, bald ablaufend, abgelaufen (MHD), Eingang, je Lagerort,
+# unter Mindestbestand, letzte Buchungen.
+# Lagerorte anpassen: die zwei Listen bei "orte" und "je_ort".
+# ==============================================================================
+template:
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: vorrat_gebucht
+        id: buchung
+      - trigger: event
+        event_type: wws_bestand_geaendert
+      - trigger: event
+        event_type: event_template_reloaded
+      - trigger: state
+        entity_id: todo.warenwirtschaft_bestand
+        for: "00:00:05"
+      - trigger: state
+        entity_id: sensor.wws_stammdaten
+      - trigger: time
+        at: "00:01:00"
+    actions:
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          a: "{{ state_attr('sensor.wws_stammdaten', 'artikel') or {} }}"
+          sammel_mind: "{{ state_attr('sensor.wws_stammdaten', 'sammel') or {} }}"
+          zeilen: >-
+            {% set ns = namespace(z=[]) %}
+            {% for it in liste['todo.warenwirtschaft_bestand']['items'] %}
+            {% set d = (it.description or '{}') | from_json(default={}) %}
+            {% if d.code is defined %}
+            {% set c = d.code | string %}{% set v = a.get(c) or ['Unbekannt (' ~ c ~ ')', '', 'Eingang', 0, 0, 0, '', 'Stück', '', ''] %}
+            {% set haltbar = v[5] | int(0) %}{% set seit = d.offen_seit | default('') %}
+            {% set ablauf = ((as_datetime(seit) + timedelta(days=haltbar)).date() | string) if seit and haltbar > 0 else '' %}
+            {% set ns.z = ns.z + [{'code': c, 'n': v[0] ~ (' – ' ~ v[1] if v[1] else ''), 'ort': d.ort | default(''), 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'seit': seit, 'ablauf': ablauf, 'mhd': d.mhd | default(''), 'von': d.von | default(''), 'sammel': v[6], 'gruppe': v[8]}] %}
+            {% endif %}{% endfor %}{{ ns.z }}
+    sensor:
+      - name: "WWS Übersicht"
+        unique_id: wws_uebersicht
+        icon: mdi:warehouse
+        unit_of_measurement: Stück
+        state: "{{ zeilen | sum(attribute='stk') }}"
+        attributes:
+          positionen: "{{ zeilen | count }}"
+          artikel_auf_lager: "{{ zeilen | selectattr('stk', 'gt', 0) | map(attribute='code') | unique | list | count }}"
+          offen: "{{ zeilen | selectattr('offen', 'gt', 0) | list }}"
+          bald_ablaufend: >-
+            {% set heute = (now() + timedelta(days=1)).date() | string %}
+            {{ zeilen | selectattr('offen', 'gt', 0) | selectattr('ablauf', 'ne', '') | selectattr('ablauf', 'le', heute) | list }}
+          abgelaufen: "{{ zeilen | selectattr('ort', 'eq', 'Abgelaufen') | list }}"
+          eingang: "{{ zeilen | selectattr('ort', 'eq', 'Eingang') | list }}"
+          orte: >-
+            {% set ns = namespace(o={}) %}
+            {% for ort in ['Vorratskammer', 'Kühlschrank', 'Gefrierschrank', 'Küchenschrank', 'Gewürzregal', 'Bad', 'Büro', 'Hundeecke', 'Putzschrank', 'Medikamentenschrank', 'Eingang', 'Abgelaufen'] %}
+            {% set r = zeilen | selectattr('ort', 'eq', ort) | list %}
+            {% set ns.o = dict(ns.o, **{ort: {'stk': r | sum(attribute='stk'), 'offen': r | sum(attribute='offen'), 'zeilen': r | map(attribute='n') | list | count}}) %}
+            {% endfor %}{{ ns.o }}
+          je_ort: >-
+            {% set ns = namespace(o={}) %}
+            {% for ort in ['Abgelaufen', 'Eingang', 'Vorratskammer', 'Kühlschrank', 'Gefrierschrank', 'Küchenschrank', 'Gewürzregal', 'Bad', 'Büro', 'Hundeecke', 'Putzschrank', 'Medikamentenschrank'] %}
+            {% set r = zeilen | selectattr('ort', 'eq', ort) | sort(attribute='n') | list %}
+            {% if r | count > 0 %}
+            {% set nl = namespace(l=[]) %}
+            {% for z in r %}{% set nl.l = nl.l + [[z.n ~ (' (aus ' ~ z.von ~ ', MHD ' ~ z.mhd ~ ')' if ort == 'Abgelaufen' else ''), z.stk, z.offen]] %}{% endfor %}
+            {% set ns.o = dict(ns.o, **{ort: nl.l}) %}
+            {% endif %}{% endfor %}{{ ns.o }}
+          unter_mindestbestand: >-
+            {% set aktiv = zeilen | rejectattr('ort', 'eq', 'Abgelaufen') | list %}
+            {% set ns = namespace(l=[], gesehen=[]) %}
+            {% for c, v in a.items() if not (c | string).startswith('GG-') and ((v[3] | int(0)) > 0 or (v[6] and (sammel_mind.get(v[6], [0])[0] | int(0)) > 0)) %}
+            {% set key = v[6] if v[6] else c %}
+            {% if key not in ns.gesehen %}{% set ns.gesehen = ns.gesehen + [key] %}
+            {% set mind = (sammel_mind.get(v[6], [0])[0] | int(0)) if v[6] else (v[3] | int(0)) %}
+            {% set bestand = (aktiv | selectattr('sammel', 'eq', v[6]) | sum(attribute='stk')) if v[6] else (aktiv | selectattr('code', 'eq', c) | sum(attribute='stk')) %}
+            {% if bestand < mind %}{% set ns.l = ns.l + [{'n': (v[6] if v[6] else v[0] ~ (' – ' ~ v[1] if v[1] else '')), 'bestand': bestand, 'mind': mind, 'laden': v[9]}] %}{% endif %}
+            {% endif %}{% endfor %}{{ ns.l | sort(attribute='n') }}
+          letzte: >-
+            {% set alt = this.attributes.letzte | default([]) %}
+            {% if trigger.id == 'buchung' %}
+            {% set d = trigger.event.data %}
+            {{ ([{'zeit': now().strftime('%d.%m. %H:%M'), 'art': d.art, 'n': d.name, 'ort': d.ort, 'stk': d.stk, 'quelle': d.quelle}] + alt)[:8] }}
+            {% else %}{{ alt }}{% endif %}

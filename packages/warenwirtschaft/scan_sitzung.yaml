@@ -1,0 +1,32 @@
+# ==============================================================================
+# Warenwirtschaft – Gedächtnis der Live-Inventur
+# Merkt sich, welche Artikel|Lagerort in der laufenden Scan-Sitzung schon gezählt
+# wurden. Erster Scan setzt den Bestand auf 1, jeder weitere zählt +1
+# (siehe script.wws_scan).
+# ==============================================================================
+template:
+  - triggers:
+      - trigger: event
+        event_type: wws_inventur_gezaehlt
+        id: zaehlen
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.wws_scan_sitzung
+        id: reset
+      - trigger: event
+        event_type: timer.cancelled
+        event_data:
+          entity_id: timer.wws_scan_sitzung
+        id: reset
+    sensor:
+      - name: "WWS Inventur-Sitzung"
+        unique_id: wws_inventur_sitzung
+        icon: mdi:clipboard-list-outline
+        state: >-
+          {% if trigger.id == 'reset' %}0
+          {% else %}{{ ((this.attributes.gezaehlt | default([])) + [trigger.event.data.key]) | unique | list | count }}{% endif %}
+        attributes:
+          gezaehlt: >-
+            {% if trigger.id == 'reset' %}{{ [] }}
+            {% else %}{{ ((this.attributes.gezaehlt | default([])) + [trigger.event.data.key | string]) | unique | list }}{% endif %}

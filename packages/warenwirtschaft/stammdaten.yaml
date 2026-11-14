@@ -1,0 +1,75 @@
+# ==============================================================================
+# Warenwirtschaft – lokale Kopie der Stammdaten aus der Google-Tabelle
+# Wird beim Start, nachts um 03:40 und auf das Ereignis "wws_stammdaten_laden"
+# neu geholt. Schlägt der Abruf fehl, bleibt die letzte Kopie erhalten.
+#
+# Attribut artikel: Artikel-Nr. → [Name, Marke, Standard-Lagerort, Mindestbestand,
+#   angebrochen (1/0), Haltbar nach Öffnen (Tage), Sammelartikel, Zählart,
+#   Warengruppe, Geschäft]      (nur Zeilen mit Aktiv = ja)
+# ==============================================================================
+template:
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time
+        at: "03:40:00"
+      - trigger: event
+        event_type: wws_stammdaten_laden
+    actions:
+      - action: shell_command.wws_stammdaten
+        response_variable: antwort
+        continue_on_error: true
+      - variables:
+          roh: >-
+            {% set s = (antwort.stdout | default('')) if antwort is defined else '' %}
+            {{ s | from_json if s[:1] == '{' else {} }}
+          ok: "{{ roh.get('status') == 'ok' }}"
+          artikel: >-
+            {% if ok %}
+              {% set ns = namespace(d={}) %}
+              {% for a in roh.artikel if a['Aktiv'] == 'ja' %}
+                {% set ns.d = dict(ns.d, **{(a['Artikel-Nr.'] | string): [
+                  a['Name'], a['Marke'], a['Standard-Lagerort'], a['Mindestbestand'] | int(1),
+                  1 if a['Wird angebrochen'] == 'ja' else 0, a['Haltbar nach Öffnen (Tage)'] | int(0),
+                  a['Sammelartikel'], a['Zählart'], a['Warengruppe'], a['Geschäft']]}) %}
+              {% endfor %}
+              {{ ns.d }}
+            {% else %}{{ this.attributes.get('artikel', {}) if this is defined else {} }}{% endif %}
+          weitere_eans: >-
+            {% if ok %}
+              {% set ns = namespace(d={}) %}
+              {% for a in roh.artikel if a['Aktiv'] == 'ja' and a['Weitere EANs'] %}
+                {% for e in a['Weitere EANs'] | regex_findall('[0-9A-Za-z-]+') %}
+                  {% set ns.d = dict(ns.d, **{e: (a['Artikel-Nr.'] | string)}) %}
+                {% endfor %}
+              {% endfor %}
+              {{ ns.d }}
+            {% else %}{{ this.attributes.get('weitere_eans', {}) if this is defined else {} }}{% endif %}
+          sammel: >-
+            {% if ok %}
+              {% set ns = namespace(d={}) %}
+              {% for s in roh.sammelartikel %}
+                {% set ns.d = dict(ns.d, **{s['Sammelartikel']: [s['Mindestbestand'] | int(1), s['Zählart']]}) %}
+              {% endfor %}
+              {{ ns.d }}
+            {% else %}{{ this.attributes.get('sammel', {}) if this is defined else {} }}{% endif %}
+          codes: >-
+            {% if ok %}
+              {% set ns = namespace(d={}) %}
+              {% for l in roh.lagerorte %}
+                {% set ns.d = dict(ns.d, **{l['Code']: l['Lagerort / Befehl']}) %}
+              {% endfor %}
+              {{ ns.d }}
+            {% else %}{{ this.attributes.get('codes', {}) if this is defined else {} }}{% endif %}
+    sensor:
+      - name: WWS Stammdaten
+        unique_id: wws_stammdaten
+        icon: mdi:database-sync
+        state: "{{ artikel | count }}"
+        attributes:
+          stand: "{{ roh.get('stand') if ok else (this.attributes.get('stand') if this is defined else none) }}"
+          letzter_abruf_ok: "{{ ok }}"
+          artikel: "{{ artikel }}"
+          weitere_eans: "{{ weitere_eans }}"
+          sammel: "{{ sammel }}"
+          codes: "{{ codes }}"

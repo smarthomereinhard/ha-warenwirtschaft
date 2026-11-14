@@ -1,0 +1,272 @@
+# ==============================================================================
+# Dashboard „Warenwirtschaft“ (Beispiel, vereinfacht)
+# Einrichtung: Einstellungen → Dashboards → Dashboard hinzufügen → „Neues Dashboard
+# von Grund auf“ → öffnen → ⋮ → Dashboard bearbeiten → ⋮ → Raw-Konfigurationseditor
+# → diesen Inhalt einfügen. Braucht die HACS-Karte „Mushroom“.
+# todo.einkaufsliste / todo.bestellen an deine Listen anpassen.
+# ==============================================================================
+views:
+  - title: Lagezentrale
+    path: lagezentrale
+    icon: mdi:radar
+    type: sections
+    max_columns: 2
+    sections:
+      - cards:
+          - type: heading
+            heading: Warenwirtschaft
+            heading_style: title
+            icon: mdi:warehouse
+            badges:
+              - type: entity
+                entity: input_boolean.wws_testmodus
+                show_state: true
+                show_icon: true
+                color: orange
+              - type: entity
+                entity: input_boolean.warenwirtschaft_ansagen
+                show_state: true
+                show_icon: true
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-template-card
+                icon: mdi:package-variant-closed
+                icon_color: cyan
+                primary: Auf Lager
+                secondary: "{{ states('sensor.wws_ubersicht') }} Stück · {{ state_attr('sensor.wws_ubersicht', 'artikel_auf_lager') }} Artikel"
+                tap_action: {action: navigate, navigation_path: lager}
+              - type: custom:mushroom-template-card
+                icon: mdi:alert-decagram
+                icon_color: "{{ 'red' if state_attr('sensor.wws_ubersicht', 'unter_mindestbestand') | default([], true) | count > 0 else 'green' }}"
+                primary: Unter Mindestbestand
+                secondary: "{{ state_attr('sensor.wws_ubersicht', 'unter_mindestbestand') | default([], true) | count }} Artikel"
+                tap_action: {action: navigate, navigation_path: bestellwesen}
+              - type: custom:mushroom-template-card
+                icon: mdi:package-variant
+                icon_color: amber
+                primary: Offene Packungen
+                secondary: "{{ state_attr('sensor.wws_ubersicht', 'offen') | default([], true) | count }}"
+                tap_action: {action: navigate, navigation_path: warenausgang}
+              - type: custom:mushroom-template-card
+                icon: mdi:timer-alert
+                icon_color: "{{ 'red' if state_attr('sensor.wws_ubersicht', 'bald_ablaufend') | default([], true) | count > 0 else 'grey' }}"
+                primary: Läuft bald ab
+                secondary: "{{ state_attr('sensor.wws_ubersicht', 'bald_ablaufend') | default([], true) | count }}"
+                tap_action: {action: navigate, navigation_path: warenausgang}
+              - type: custom:mushroom-template-card
+                icon: mdi:inbox-arrow-down
+                icon_color: "{{ 'orange' if state_attr('sensor.wws_ubersicht', 'eingang') | default([], true) | count > 0 else 'grey' }}"
+                primary: Im Eingang
+                secondary: "{{ state_attr('sensor.wws_ubersicht', 'eingang') | default([], true) | count }} zu klären"
+                tap_action: {action: navigate, navigation_path: wareneingang}
+              - type: custom:mushroom-template-card
+                icon: mdi:database
+                icon_color: "{{ 'blue' if state_attr('sensor.wws_stammdaten', 'letzter_abruf_ok') else 'red' }}"
+                primary: Stammdaten
+                secondary: "{{ states('sensor.wws_stammdaten') }} Artikel · {{ 'ok' if state_attr('sensor.wws_stammdaten', 'letzter_abruf_ok') else 'Abruf fehlgeschlagen' }}"
+                tap_action: {action: navigate, navigation_path: einstellungen}
+          - type: heading
+            heading: Einkaufsliste
+            icon: mdi:cart-outline
+          - type: todo-list
+            entity: todo.einkaufsliste
+            hide_completed: true
+      - cards:
+          - type: heading
+            heading: Letzte Buchungen
+            icon: mdi:history
+          - type: markdown
+            content: |-
+              {% set l = state_attr('sensor.wws_ubersicht', 'letzte') | default([], true) %}{% set sym = {'einbuchen': '📥', 'entnehmen': '📤', 'leer': '🫥', 'muell': '🗑️', 'umbuchen': '🔄', 'inventur': '📋'} %}{% for b in l[:5] %}{{ sym.get(b.art, '📦') }} **{{ b.n }}** · {{ b.ort }} → {{ b.stk }} Stück
+              <small>{{ b.zeit }} · {{ b.quelle }}</small>
+
+              {% else %}Noch keine Buchungen.{% endfor %}
+          - type: heading
+            heading: Schnell buchen
+            icon: mdi:lightning-bolt
+          - &buchen
+            type: entities
+            entities:
+              - entity: input_text.wws_eingabe_barcode
+                name: Barcode oder Name
+              - entity: input_select.wws_eingabe_buchungsart
+                name: Buchungsart
+              - entity: input_number.wws_eingabe_anzahl
+                name: Anzahl
+              - entity: input_select.wws_eingabe_lagerort
+                name: Lagerort
+              - type: button
+                name: Buchen
+                icon: mdi:check-bold
+                action_name: BUCHEN
+                tap_action:
+                  action: perform-action
+                  perform_action: script.wws_dashboard_buchen
+              - entity: input_text.wws_letzte_ruckmeldung
+                name: Rückmeldung
+
+  - title: Wareneingang
+    path: wareneingang
+    icon: mdi:truck-delivery
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    sections:
+      - cards:
+          - type: heading
+            heading: Manuell buchen
+            icon: mdi:barcode-scan
+          - *buchen
+      - cards:
+          - type: heading
+            heading: Im Eingang – zu klären
+            icon: mdi:inbox-arrow-down
+          - type: markdown
+            content: |-
+              {% for x in state_attr('sensor.wws_ubersicht', 'eingang') | default([], true) %}• **{{ x.n }}** · {{ x.stk }} Stück · `{{ x.code }}`
+              {% else %}Der Eingang ist leer.{% endfor %}
+
+              <small>Unbekannte Artikel per Telegram mit `/artikel <EAN> Name – Marke` benennen, danach auf den richtigen Lagerort umbuchen.</small>
+
+  - title: Warenausgang
+    path: warenausgang
+    icon: mdi:export
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    sections:
+      - cards:
+          - type: heading
+            heading: Offene Packungen
+            icon: mdi:package-variant
+          - type: markdown
+            content: |-
+              {% for x in state_attr('sensor.wws_ubersicht', 'offen') | default([], true) | sort(attribute='seit') %}• **{{ x.n }}** · {{ x.ort }} · {{ x.offen }} offen seit {{ as_datetime(x.seit).strftime('%d.%m.') if x.seit else '?' }}{{ ' · ⚠️ haltbar bis ' ~ as_datetime(x.ablauf).strftime('%d.%m.') if x.ablauf else '' }}
+              {% else %}Keine offenen Packungen.{% endfor %}
+      - cards:
+          - type: heading
+            heading: Entnehmen / Leer / Müll
+            icon: mdi:delete-variant
+          - *buchen
+
+  - title: Lager
+    path: lager
+    icon: mdi:warehouse
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    max_columns: 2
+    sections:
+      - column_span: 2
+        cards:
+          - type: heading
+            heading: Lagerorte
+            icon: mdi:map-marker-multiple
+          - type: markdown
+            content: |-
+              {% set j = state_attr('sensor.wws_ubersicht', 'je_ort') or {} %}{% set o = state_attr('sensor.wws_ubersicht', 'orte') or {} %}{% set ic = {'Abgelaufen': '⏰', 'Eingang': '📥', 'Vorratskammer': '🥫', 'Kühlschrank': '🧊', 'Gefrierschrank': '❄️', 'Küchenschrank': '🍳', 'Gewürzregal': '🧂', 'Bad': '🛁', 'Büro': '💼', 'Hundeecke': '🐕', 'Putzschrank': '🧽', 'Medikamentenschrank': '💊'} %}{% for ort in ic.keys() %}{% set w = o.get(ort, {'stk': 0, 'offen': 0, 'zeilen': 0}) %}{% if w.zeilen > 0 %}
+              <details><summary><b>{{ ic[ort] }} {{ ort }}</b> · {{ w.stk }} Stk · {{ w.zeilen }} Artikel{{ ' · ' ~ w.offen ~ ' offen' if w.offen else '' }}</summary>
+
+              | Artikel | Stk |
+              |:---|---:|
+              {% for a in j.get(ort, []) %}| {{ a[0] }}{{ ' · ' ~ a[2] ~ ' offen' if a[2] else '' }} | {{ a[1] }} |
+              {% endfor %}
+              </details>
+              {% endif %}{% endfor %}
+
+  - title: Bestellwesen
+    path: bestellwesen
+    icon: mdi:cart
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    max_columns: 3
+    sections:
+      - cards:
+          - type: heading
+            heading: Unter Mindestbestand
+            icon: mdi:alert-decagram
+          - type: markdown
+            content: |-
+              {% set l = state_attr('sensor.wws_ubersicht', 'unter_mindestbestand') | default([], true) %}{% for g in l | groupby('laden') %}**{{ g.grouper or 'ohne Geschäft' }}**
+              {% for x in g.list %}• {{ x.n }} · {{ x.bestand }}/{{ x.mind }}
+              {% endfor %}
+              {% else %}Alles ausreichend vorrätig.{% endfor %}
+      - cards:
+          - type: heading
+            heading: Einkaufsliste
+            icon: mdi:cart-outline
+          - type: todo-list
+            entity: todo.einkaufsliste
+            hide_completed: true
+      - cards:
+          - type: heading
+            heading: Bestellen (online)
+            icon: mdi:truck-fast
+          - type: todo-list
+            entity: todo.bestellen
+            hide_completed: true
+
+  - title: Inventur
+    path: inventur
+    icon: mdi:clipboard-list
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    sections:
+      - cards:
+          - type: heading
+            heading: Scan-Sitzung
+            icon: mdi:barcode-scan
+          - type: entities
+            entities:
+              - entity: input_select.wws_scan_modus
+                name: Modus
+              - entity: input_text.wws_scan_lagerort
+                name: Lagerort
+              - entity: timer.wws_scan_sitzung
+                name: Sitzung läuft noch
+              - entity: sensor.wws_inventur_sitzung
+                name: Gezählte Artikel (Live-Inventur)
+      - cards:
+          - type: heading
+            heading: So geht die Inventur
+            icon: mdi:help-circle
+          - type: markdown
+            content: |-
+              **Live mit dem Kurzbefehl:** Etikett *CMD-INV* → Lagerort-Etikett (z. B. *LO-KUEHL*)
+              → jede Packung einmal scannen (erster Scan setzt 1, jeder weitere +1) → *CMD-ENDE*.
+
+
+              **Mit der Inventur-App:** Lagerort-Code und dann alle Packungen scannen, CSV über
+              „Teilen“ an den Kurzbefehl *WWS CSV-Import*. Nicht gescannte Artikel werden nur
+              gemeldet – genullt wird nichts automatisch.
+
+  - title: Einstellungen
+    path: einstellungen
+    icon: mdi:cog
+    type: sections
+    subview: true
+    back_path: lagezentrale
+    sections:
+      - cards:
+          - type: entities
+            entities:
+              - entity: input_boolean.wws_testmodus
+                name: Testmodus (kein Sheet, Test-Einkaufsliste, Meldungen per Telegram)
+              - entity: input_boolean.warenwirtschaft_ansagen
+                name: Warenwirtschaft-Ansagen
+              - type: button
+                name: Stammdaten jetzt neu laden
+                icon: mdi:database-refresh
+                action_name: LADEN
+                tap_action:
+                  action: perform-action
+                  perform_action: script.wws_stammdaten_neu_laden
+      - cards:
+          - type: markdown
+            content: |-
+              **Stammdaten:** {{ states('sensor.wws_stammdaten') }} Artikel,
+              Stand {{ state_attr('sensor.wws_stammdaten', 'stand') }}

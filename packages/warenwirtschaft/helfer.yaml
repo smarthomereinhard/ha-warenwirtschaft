@@ -1,0 +1,68 @@
+# ==============================================================================
+# Warenwirtschaft – Helfer
+# (Die Todo-Listen legst du in der Oberfläche an, siehe README → Einrichtung.)
+# ==============================================================================
+input_boolean:
+  wws_testmodus:
+    name: WWS Testmodus
+    icon: mdi:test-tube
+  warenwirtschaft_ansagen:
+    name: Warenwirtschaft-Ansagen
+    icon: mdi:account-voice
+
+input_number:
+  wws_eingabe_anzahl:
+    name: WWS Eingabe Anzahl
+    min: 1
+    max: 99
+    step: 1
+    initial: 1
+    mode: box
+    icon: mdi:counter
+
+input_select:
+  wws_eingabe_buchungsart:
+    name: WWS Eingabe Buchungsart
+    icon: mdi:swap-horizontal
+    options: [einbuchen, entnehmen, leer, muell, umbuchen, inventur]
+  wws_eingabe_lagerort:
+    name: WWS Eingabe Lagerort
+    icon: mdi:map-marker
+    options:
+      - automatisch
+      - Vorratskammer
+      - Kühlschrank
+      - Gefrierschrank
+      - Küchenschrank
+      - Gewürzregal
+      - Bad
+      - Büro
+      - Hundeecke
+      - Putzschrank
+      - Medikamentenschrank
+      - Eingang
+  wws_scan_modus:
+    name: WWS Scan-Modus
+    icon: mdi:barcode-scan
+    options: [entnehmen, einbuchen, umbuchen, inventur, muell, leer]
+
+input_text:
+  wws_eingabe_barcode:
+    name: WWS Eingabe Barcode
+    max: 100
+    icon: mdi:barcode
+  wws_letzte_ruckmeldung:
+    name: WWS Letzte Rückmeldung
+    max: 255
+    icon: mdi:message-reply-text
+  wws_scan_lagerort:
+    name: WWS Scan-Lagerort
+    max: 50
+    icon: mdi:map-marker-radius
+
+timer:
+  wws_scan_sitzung:
+    name: WWS Scan-Sitzung
+    duration: "00:10:00"
+    restore: true
+    icon: mdi:timer-sand

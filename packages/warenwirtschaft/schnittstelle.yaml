@@ -1,0 +1,31 @@
+# ==============================================================================
+# Warenwirtschaft – Schnittstelle zur Google-Tabelle (Apps-Script-Web-App)
+# ------------------------------------------------------------------------------
+# VOR DEM EINSATZ ERSETZEN:
+#   DEINE_WEBAPP_URL  → die Web-App-URL aus Apps Script (…/exec)
+#   DEIN_TOKEN        → dasselbe Geheimwort wie TOKEN in google-apps-script/Code.gs
+#                       (im Query-String URL-kodiert, z. B. ! → %21)
+# Hinweis: shell_command kann !secret nur für den ganzen Befehl nutzen. Wer URL und
+# Token nicht im Paket stehen haben will, legt die drei Befehle komplett in
+# secrets.yaml ab und schreibt hier z. B.  wws_senden: !secret wws_senden
+#
+# Antworten kommen als JSON in stdout (response_variable).
+# HA rendert erst das Template und zerlegt dann mit shlex → JSON in einfache
+# Anführungszeichen, ' wird maskiert.
+# ==============================================================================
+shell_command:
+  wws_stammdaten: >-
+    curl -sS -L --max-time 60
+    "DEINE_WEBAPP_URL?action=stammdaten&token=DEIN_TOKEN{{ '' }}"
+  wws_artikel: >-
+    curl -sS -L --max-time 30
+    "DEINE_WEBAPP_URL?action=artikel&token=DEIN_TOKEN&code={{ code | string | urlencode }}"
+  wws_senden: >-
+    curl -sS -L --max-time 30 -H "Content-Type: application/json"
+    -d '{{ (dict(daten, token='DEIN_TOKEN') | tojson) | replace("'", "'\"'\"'") }}'
+    "DEINE_WEBAPP_URL"
+  # Unbekannte Barcodes bei OpenFoodFacts / OpenBeautyFacts / OpenProductsFacts nachschlagen
+  wws_off: >-
+    bash -c 'c="$1"; for h in de.openfoodfacts.org world.openbeautyfacts.org world.openproductsfacts.org; do
+    r=$(curl -sS -L --max-time 8 -A "HomeAssistant-WWS/1.0" "https://$h/api/v2/product/$c.json?fields=product_name,product_name_de,brands,quantity,categories");
+    case "$r" in *"\"status\":1"*) echo "$r"; exit 0;; esac; done; echo "{\"status\":0}"' -- {{ code | string | regex_replace('[^0-9A-Za-z-]', '') }}

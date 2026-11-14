@@ -1,0 +1,596 @@
+# ==============================================================================
+# Warenwirtschaft – Automationen
+#   Eingang Webhook (Scan & CSV)  · Meldungen im JARVIS-Stil
+#   Mindestbestand & Einkaufsliste · MHD abgelaufen (Telegram mit Bestätigung)
+#   Offene Packungen: Haltbarkeit  · Scan-Sitzung abgelaufen
+#   Telegram /artikel und /wo      · NFC-Tags
+# Platzhalter: siehe README (secrets, notify.mobile_app_DEIN_HANDY,
+# input_boolean.jemand_zuhause, todo.einkaufsliste, todo.bestellen)
+# ==============================================================================
+automation:
+  - id: wws_eingang_webhook
+    alias: "WWS – Eingang Webhook (Scan & CSV)"
+    description: >-
+      Eingang für Kurzbefehle, NFC und Scanner. Webhook vorrat_scan: JSON
+      {code|barcode, art|buchungsart, lagerort, anzahl, quelle} → script.wws_scan.
+      Webhook vorrat_csv: JSON {csv|text, art (inventur|einbuchen), lagerort,
+      quelle} → script.wws_csv_import. Beide nur im Heimnetz erreichbar.
+    mode: queued
+    max: 50
+    triggers:
+      - trigger: webhook
+        webhook_id: vorrat_scan
+        allowed_methods: [POST, PUT]
+        local_only: true
+        id: scan
+      - trigger: webhook
+        webhook_id: vorrat_csv
+        allowed_methods: [POST, PUT]
+        local_only: true
+        id: csv
+    actions:
+      - variables:
+          d: "{{ trigger.json if trigger.json is defined and trigger.json is mapping else (trigger.data | default({})) }}"
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: scan
+            sequence:
+              - action: script.wws_scan
+                data:
+                  code: "{{ (d.code | default(d.barcode | default(''))) | string | trim }}"
+                  art: "{{ d.art | default(d.buchungsart | default('')) | string | lower }}"
+                  lagerort: "{{ d.lagerort | default('') }}"
+                  anzahl: "{{ d.anzahl | default(1) | int(1) }}"
+                  quelle: "{{ d.quelle | default('kurzbefehl') }}"
+          - conditions:
+              - condition: trigger
+                id: csv
+            sequence:
+              - action: script.wws_csv_import
+                data:
+                  csv: "{{ d.csv | default(d.text | default('')) }}"
+                  art: "{{ d.art | default('inventur') | string | lower }}"
+                  lagerort: "{{ d.lagerort | default('') }}"
+                  quelle: "{{ d.quelle | default('inventur-app') }}"
+
+  - id: wws_meldungen
+    alias: "WWS – Meldungen im JARVIS-Stil"
+    description: >-
+      Rückmeldung zu jeder Buchung (vorrat_gebucht). Testmodus: nur Telegram mit 🧪.
+      Medikamente: nur Push. Unbekannte Artikel: script.wws_unbekannt. Sonst: jemand
+      zu Hause und Ansagen an → kurze Sprachausgabe, sonst Telegram. Inventur,
+      CSV-Import und Kassenzettel melden nicht pro Artikel.
+    mode: queued
+    max: 50
+    triggers:
+      - trigger: event
+        event_type: vorrat_gebucht
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.event.data.quelle not in ['inventur-app', 'kassenzettel', 'unbekannt-geklaert', 'korrektur'] and trigger.event.data.art != 'inventur' }}"
+    actions:
+      - variables:
+          d: "{{ trigger.event.data }}"
+          gruppe: "{{ ((state_attr('sensor.wws_stammdaten', 'artikel') or {}).get(trigger.event.data.code | string) or ['', '', '', 0, 0, 0, '', '', ''])[8] }}"
+          test: "{{ trigger.event.data.testmodus | string | lower == 'true' }}"
+      - if:
+          - condition: template
+            value_template: "{{ d.bekannt | string | lower != 'true' and d.art in ['einbuchen', 'inventur'] }}"
+        then:
+          - action: script.wws_unbekannt
+            data:
+              code: "{{ d.code | string }}"
+              ort: "{{ d.ort }}"
+          - stop: Unbekannter Artikel – Klärung läuft
+      - variables:
+          symbol: "{{ {'einbuchen': '📥', 'entnehmen': '📤', 'leer': '🫥', 'muell': '🗑️', 'umbuchen': '🔄'}.get(d.art, '📦') }}"
+          kurz: >-
+            {% set n = d.name %}{% set stk = d.stk | int(0) %}{% set ort = d.ort %}{% set unter = (d.mind | int(0)) > 0 and (d.gesamt | int(0)) < (d.mind | int(0)) %}{% set liste = ' Ich habe es auf die Einkaufsliste gesetzt.' if unter else '' %}{% if d.notiz == 'Kein Bestand erfasst' %}Hinweis, Master. {{ n }} war bei mir nicht im Bestand erfasst. Ich habe es trotzdem notiert.{% elif d.art == 'einbuchen' %}{{ ['Eingebucht, Master.', 'Sehr wohl, Master.', 'Notiert, Master.'] | random }} {{ n }}, jetzt {{ stk }} Stück im {{ ort }}.{% elif d.art == 'entnehmen' and d.notiz == 'Packungswechsel' %}Packungswechsel bei {{ n }}, Master. Die alte Packung ist ausgebucht, die neue ist offen. Noch {{ stk }} auf Lager.{{ liste }}{% elif d.art == 'entnehmen' %}{{ n }} entnommen. {{ 'Noch ' ~ stk ~ ' auf Lager.' if stk > 0 else 'Das war die letzte Packung, Master.' }}{{ liste }}{% elif d.art == 'leer' %}{{ n }} ist aufgebraucht, Master.{{ liste }}{% elif d.art == 'muell' %}{{ n }} ist entsorgt, Master.{{ ' Noch ' ~ stk ~ ' auf Lager.' if stk > 0 else '' }}{{ liste }}{% elif d.art == 'umbuchen' %}{{ n }} umgebucht, {{ ort | replace('→', 'nach') }}.{% else %}{{ n }}: {{ d.art }} gebucht.{% endif %}
+      - choose:
+          - alias: "Medikamente: nur Push"
+            conditions:
+              - condition: template
+                value_template: "{{ gruppe == 'Medikamente' }}"
+            sequence:
+              - action: notify.mobile_app_DEIN_HANDY
+                data:
+                  title: "💊 Warenwirtschaft{{ ' (Test)' if test else '' }}"
+                  message: "{{ kurz }}"
+          - alias: "Testmodus: nur Telegram"
+            conditions:
+              - condition: state
+                entity_id: input_boolean.wws_testmodus
+                state: "on"
+            sequence:
+              - action: telegram_bot.send_message
+                continue_on_error: true
+                data:
+                  chat_id: !secret wws_telegram_chat_id
+                  config_entry_id: !secret wws_telegram_config_entry_id
+                  message: "🧪 Test · {{ symbol }} {{ kurz }}"
+          - alias: "Ansagen aus: still"
+            conditions:
+              - condition: state
+                entity_id: input_boolean.warenwirtschaft_ansagen
+                state: "off"
+            sequence:
+              - stop: Ansagen ausgeschaltet
+          - alias: "Jemand zu Hause: Sprachausgabe"
+            conditions:
+              - condition: state
+                entity_id: input_boolean.jemand_zuhause
+                state: "on"
+            sequence:
+              - action: script.wws_ansage
+                continue_on_error: true
+                data:
+                  message: "{{ kurz }}"
+        default:
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data:
+              chat_id: !secret wws_telegram_chat_id
+              config_entry_id: !secret wws_telegram_config_entry_id
+              message: "🤖 {{ symbol }} {{ kurz }}"
+
+  - id: wws_einkaufsliste
+    alias: "WWS – Mindestbestand & Einkaufsliste"
+    description: >-
+      Fällt der ungeöffnete Bestand (bei Sammelartikeln die Summe) unter den
+      Mindestbestand, kommt der Artikel als „Produkt – Marke“ auf die Einkaufsliste
+      (Online-Geschäft → Liste Bestellen; Batterien mit Stückzahl). Beim Einbuchen
+      bzw. der Inventur verschwindet der Eintrag, sobald der Mindestbestand wieder
+      erreicht ist. Im Testmodus nur in todo.wws_einkaufsliste_test.
+    mode: queued
+    max: 50
+    triggers:
+      - trigger: event
+        event_type: vorrat_gebucht
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.event.data.bekannt | string | lower == 'true' and (trigger.event.data.mind | int(0)) > 0 }}"
+    actions:
+      - variables:
+          d: "{{ trigger.event.data }}"
+          a: "{{ (state_attr('sensor.wws_stammdaten', 'artikel') or {}).get(trigger.event.data.code | string, ['', '', '', 0, 0, 0, '', 'Stück', '', '']) }}"
+      - variables:
+          basis: "{{ d.sammel if d.sammel else d.name }}"
+          eintrag: >-
+            {% set basis = d.sammel if d.sammel else d.name %}{% set fehl = [(d.mind | int(0)) - (d.gesamt | int(0)), 1] | max %}{% if a[8] == 'Batterien' %}{{ basis }} ({{ fehl }} Stück){% else %}{{ basis }}{{ ' – ' ~ d.marke if d.marke else '' }}{% endif %}
+          geschaeft: "{{ a[9] | default('') }}"
+          liste: >-
+            {% if trigger.event.data.testmodus | string | lower == 'true' %}todo.wws_einkaufsliste_test{% elif (a[9] | default('') | lower) in ['amazon', 'online', 'bestellen'] %}todo.bestellen{% else %}todo.einkaufsliste{% endif %}
+          unter: "{{ (d.gesamt | int(0)) < (d.mind | int(0)) }}"
+      - action: todo.get_items
+        target:
+          entity_id: "{{ liste }}"
+        data:
+          status: needs_action
+        response_variable: offen
+      - variables:
+          treffer: >-
+            {% set ns = namespace(u=[]) %}{% for it in offen[liste]['items'] %}{% if (it.summary | lower).startswith(basis | lower) %}{% set ns.u = ns.u + [it.uid] %}{% endif %}{% endfor %}{{ ns.u }}
+      - choose:
+          - alias: Unter Mindestbestand → auf die Liste (ohne Dubletten)
+            conditions:
+              - condition: template
+                value_template: "{{ unter and d.art in ['entnehmen', 'leer', 'muell', 'umbuchen', 'inventur'] and treffer | count == 0 }}"
+            sequence:
+              - action: todo.add_item
+                target:
+                  entity_id: "{{ liste }}"
+                data:
+                  item: "{{ eintrag }}"
+                  description: "Automatisch (Warenwirtschaft){{ ' · Geschäft: ' ~ geschaeft if geschaeft else '' }} · Bestand {{ d.gesamt }} von mind. {{ d.mind }}"
+              - event: wws_einkaufsliste_neu
+                event_data:
+                  eintrag: "{{ eintrag }}"
+                  geschaeft: "{{ geschaeft }}"
+                  liste: "{{ liste }}"
+          - alias: Mindestbestand wieder erreicht → von der Liste
+            conditions:
+              - condition: template
+                value_template: "{{ not unter and d.art in ['einbuchen', 'inventur', 'umbuchen'] and treffer | count > 0 }}"
+            sequence:
+              - action: todo.remove_item
+                target:
+                  entity_id: "{{ liste }}"
+                data:
+                  item: "{{ treffer }}"
+
+  - id: wws_mhd_abgelaufen
+    alias: "WWS – MHD abgelaufen (Telegram mit Bestätigung)"
+    description: >-
+      Täglich 09:30: Zeilen mit überschrittenem MHD werden nicht gelöscht, sondern in
+      den virtuellen Lagerort „Abgelaufen“ umgebucht (Herkunft im Feld von) und zählen
+      nicht mehr für den Mindestbestand. Pro Produkt eine Telegram-Nachricht mit
+      Buttons „🗑 Entsorgt“ (Zeile endgültig entfernen) und „✅ Noch da“ (zurück an
+      den alten Ort, MHD löschen).
+    mode: queued
+    max: 20
+    variables:
+      chat: !secret wws_telegram_chat_id
+      bot_entry: !secret wws_telegram_config_entry_id
+      testmodus: "{{ is_state('input_boolean.wws_testmodus', 'on') }}"
+    triggers:
+      - trigger: time
+        at: "09:30:00"
+        id: pruefen
+      - trigger: event
+        event_type: telegram_callback
+        id: button
+    actions:
+      - choose:
+          - alias: Button gedrückt (Entsorgt / Noch da)
+            conditions:
+              - condition: trigger
+                id: button
+              - condition: template
+                value_template: "{{ (trigger.event.data.data | default('') | string).startswith(('/mhd_weg ', '/mhd_da ')) }}"
+            sequence:
+              - variables:
+                  befehl: "{{ trigger.event.data.data.split(' ')[0] }}"
+                  uid: "{{ trigger.event.data.data.split(' ')[1] | default('') }}"
+              - action: todo.get_items
+                target:
+                  entity_id: todo.warenwirtschaft_bestand
+                data:
+                  status: needs_action
+                response_variable: liste
+              - variables:
+                  z: >-
+                    {% set t = liste['todo.warenwirtschaft_bestand']['items'] | selectattr('uid', 'eq', uid) | list %}{% if t %}{% set d = (t[0].description or '{}') | from_json(default={}) %}{% set v = (state_attr('sensor.wws_stammdaten', 'artikel') or {}).get(d.code | default('') | string) or ['Unbekannt (' ~ d.code | default('?') ~ ')', '', 'Eingang'] %}{{ {'ok': d.ort | default('') == 'Abgelaufen', 'code': d.code | default('') | string, 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'offen_seit': d.offen_seit | default(''), 'mhd': d.mhd | default(''), 'von': d.von | default('') or v[2] or 'Eingang', 'name': v[0], 'marke': v[1]} }}{% else %}{{ {'ok': false} }}{% endif %}
+              - if:
+                  - condition: template
+                    value_template: "{{ not z.ok }}"
+                then:
+                  - action: telegram_bot.answer_callback_query
+                    continue_on_error: true
+                    data:
+                      callback_query_id: "{{ trigger.event.data.id }}"
+                      config_entry_id: "{{ bot_entry }}"
+                      message: Bereits erledigt.
+                  - stop: Zeile nicht (mehr) im Lagerort Abgelaufen
+              - choose:
+                  - alias: 🗑 Entsorgt → Zeile endgültig ausbuchen
+                    conditions:
+                      - condition: template
+                        value_template: "{{ befehl == '/mhd_weg' }}"
+                    sequence:
+                      - action: todo.remove_item
+                        target:
+                          entity_id: todo.warenwirtschaft_bestand
+                        data:
+                          item: "{{ uid }}"
+                      - action: telegram_bot.answer_callback_query
+                        continue_on_error: true
+                        data:
+                          callback_query_id: "{{ trigger.event.data.id }}"
+                          config_entry_id: "{{ bot_entry }}"
+                          message: "Entsorgt: {{ z.name }}"
+                      - action: telegram_bot.edit_message
+                        continue_on_error: true
+                        data:
+                          chat_id: "{{ trigger.event.data.chat_id }}"
+                          message_id: "{{ trigger.event.data.message.message_id }}"
+                          config_entry_id: "{{ bot_entry }}"
+                          parse_mode: plain_text
+                          message: |-
+                            🤖 JARVIS: {{ ['Sehr wohl, Master.', 'Erledigt, Master.', 'Notiert, Master.'] | random }}
+                            🗑 {{ z.stk }}× {{ z.name }}{{ ' – ' ~ z.marke if z.marke else '' }} (aus {{ z.von }}, MHD {{ as_datetime(z.mhd).strftime('%d.%m.%Y') if z.mhd else '–' }}) ist entsorgt und ausgebucht.
+                      - if:
+                          - condition: template
+                            value_template: "{{ not testmodus }}"
+                        then:
+                          - action: shell_command.wws_senden
+                            continue_on_error: true
+                            data:
+                              daten: "{{ {'action': 'buchung', 'art': 'muell', 'quelle': 'mhd', 'code': z.code, 'name': z.name, 'lagerort': 'Abgelaufen', 'anzahl': z.stk, 'bestand_danach': 0, 'notiz': 'MHD ' ~ z.mhd ~ ' überschritten, entsorgt (aus ' ~ z.von ~ ')'} }}"
+                          - action: shell_command.wws_senden
+                            continue_on_error: true
+                            data:
+                              daten: "{{ {'action': 'bestand', 'code': z.code, 'name': z.name, 'lagerort': 'Abgelaufen', 'stueck': 0, 'offen': 0, 'offen_seit': '', 'haltbar_bis': z.mhd} }}"
+                  - alias: ✅ Noch da → zurück an den alten Lagerort, MHD löschen
+                    conditions:
+                      - condition: template
+                        value_template: "{{ befehl == '/mhd_da' }}"
+                    sequence:
+                      - variables:
+                          vorhanden: >-
+                            {% set ns = namespace(t=none) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] if it.uid != uid %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if (d.code | default('') | string) == z.code and d.ort | default('') == z.von %}{% set ns.t = {'stk': d.stk | int(0)} %}{% endif %}{% endfor %}{{ ns.t }}
+                      - if:
+                          - condition: template
+                            value_template: "{{ vorhanden is mapping }}"
+                        then:
+                          - alias: Am alten Ort gibt es schon eine Zeile → dazuzählen
+                            action: script.wws_bestand_setzen
+                            data:
+                              code: "{{ z.code }}"
+                              ort: "{{ z.von }}"
+                              delta_stk: "{{ z.stk }}"
+                              delta_offen: "{{ z.offen }}"
+                          - action: todo.remove_item
+                            target:
+                              entity_id: todo.warenwirtschaft_bestand
+                            data:
+                              item: "{{ uid }}"
+                        else:
+                          - action: todo.update_item
+                            target:
+                              entity_id: todo.warenwirtschaft_bestand
+                            data:
+                              item: "{{ uid }}"
+                              rename: "{{ z.stk }}× {{ z.name }}{{ ' – ' ~ z.marke if z.marke else '' }} · {{ z.von }}{{ ' · ' ~ z.offen ~ ' offen' if z.offen > 0 else '' }}"
+                              description: "{{ {'code': z.code, 'ort': z.von, 'stk': z.stk, 'offen': z.offen, 'offen_seit': z.offen_seit, 'mhd': ''} | tojson }}"
+                      - action: telegram_bot.answer_callback_query
+                        continue_on_error: true
+                        data:
+                          callback_query_id: "{{ trigger.event.data.id }}"
+                          config_entry_id: "{{ bot_entry }}"
+                          message: "Zurück in {{ z.von }}"
+                      - action: telegram_bot.edit_message
+                        continue_on_error: true
+                        data:
+                          chat_id: "{{ trigger.event.data.chat_id }}"
+                          message_id: "{{ trigger.event.data.message.message_id }}"
+                          config_entry_id: "{{ bot_entry }}"
+                          parse_mode: plain_text
+                          message: |-
+                            🤖 JARVIS: Sehr wohl, Master.
+                            ✅ {{ z.stk }}× {{ z.name }}{{ ' – ' ~ z.marke if z.marke else '' }} ist wieder im {{ z.von }} gebucht. Für diesen Artikel melde ich das MHD nicht erneut.
+                      - if:
+                          - condition: template
+                            value_template: "{{ not testmodus }}"
+                        then:
+                          - action: shell_command.wws_senden
+                            continue_on_error: true
+                            data:
+                              daten: "{{ {'action': 'bestand', 'code': z.code, 'name': z.name, 'lagerort': 'Abgelaufen', 'stueck': 0, 'offen': 0, 'offen_seit': '', 'haltbar_bis': ''} }}"
+                          - action: shell_command.wws_senden
+                            continue_on_error: true
+                            data:
+                              daten: "{{ {'action': 'bestand', 'code': z.code, 'name': z.name, 'lagerort': z.von, 'stueck': z.stk + (vorhanden.stk if vorhanden is mapping else 0), 'offen': z.offen, 'offen_seit': z.offen_seit, 'haltbar_bis': ''} }}"
+          - alias: Tägliche Prüfung (09:30 oder manuell)
+            conditions:
+              - condition: not
+                conditions:
+                  - condition: trigger
+                    id: button
+            sequence:
+              - action: todo.get_items
+                target:
+                  entity_id: todo.warenwirtschaft_bestand
+                data:
+                  status: needs_action
+                response_variable: liste
+              - variables:
+                  faellig: >-
+                    {% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set heute = now().date().isoformat() %}{% set ns = namespace(l=[]) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% set m = d.mhd | default('') | string %}{% if d.code is defined and m | length == 10 and m < heute and d.ort | default('') != 'Abgelaufen' and (d.stk | int(0) > 0 or d.offen | int(0) > 0) %}{% set v = a.get(d.code | string) or ['Unbekannt (' ~ d.code ~ ')', ''] %}{% set ns.l = ns.l + [{'uid': it.uid, 'code': d.code | string, 'ort': d.ort | default('Eingang'), 'stk': d.stk | int(0), 'offen': d.offen | int(0), 'offen_seit': d.offen_seit | default(''), 'mhd': m, 'name': v[0], 'marke': v[1]}] %}{% endif %}{% endfor %}{{ ns.l }}
+              - condition: template
+                value_template: "{{ faellig | count > 0 }}"
+              - repeat:
+                  for_each: "{{ faellig }}"
+                  sequence:
+                    - variables:
+                        r: "{{ repeat.item }}"
+                    - alias: Vorläufig ausbuchen – in Lagerort „Abgelaufen“ umbuchen (nicht löschen)
+                      action: todo.update_item
+                      target:
+                        entity_id: todo.warenwirtschaft_bestand
+                      data:
+                        item: "{{ r.uid }}"
+                        rename: "{{ r.stk }}× {{ r.name }}{{ ' – ' ~ r.marke if r.marke else '' }} · Abgelaufen (aus {{ r.ort }})"
+                        description: "{{ {'code': r.code, 'ort': 'Abgelaufen', 'stk': r.stk, 'offen': r.offen, 'offen_seit': r.offen_seit, 'mhd': r.mhd, 'von': r.ort} | tojson }}"
+                    - action: telegram_bot.send_message
+                      continue_on_error: true
+                      data:
+                        chat_id: "{{ chat }}"
+                        config_entry_id: "{{ bot_entry }}"
+                        parse_mode: plain_text
+                        inline_keyboard:
+                          - "🗑 Entsorgt:/mhd_weg {{ r.uid }}, ✅ Noch da:/mhd_da {{ r.uid }}"
+                        message: |-
+                          🤖 JARVIS: Master, ein Produkt hat sein Mindesthaltbarkeitsdatum überschritten.
+
+                          ⚠️ {{ r.stk }}× {{ r.name }}{{ ' – ' ~ r.marke if r.marke else '' }}{{ ' (' ~ r.offen ~ ' offen)' if r.offen > 0 else '' }}
+                          📍 {{ r.ort }}
+                          📅 MHD {{ as_datetime(r.mhd).strftime('%d.%m.%Y') }}
+
+                          Ich habe es vorläufig ausgebucht. Ist es entsorgt oder noch da?
+                    - if:
+                        - condition: template
+                          value_template: "{{ not testmodus }}"
+                      then:
+                        - action: shell_command.wws_senden
+                          continue_on_error: true
+                          data:
+                            daten: "{{ {'action': 'bestand', 'code': r.code, 'name': r.name, 'lagerort': r.ort, 'stueck': 0, 'offen': 0, 'offen_seit': '', 'haltbar_bis': r.mhd} }}"
+                        - action: shell_command.wws_senden
+                          continue_on_error: true
+                          data:
+                            daten: "{{ {'action': 'bestand', 'code': r.code, 'name': r.name, 'lagerort': 'Abgelaufen', 'stueck': r.stk, 'offen': r.offen, 'offen_seit': r.offen_seit, 'haltbar_bis': r.mhd} }}"
+
+  - id: wws_haltbarkeit
+    alias: "WWS – Offene Packungen: Haltbarkeit"
+    description: >-
+      Täglich 09:12: offene Packungen, deren „Haltbar nach Öffnen“ heute oder morgen
+      endet, kommen per Telegram (Medikamente nur als Push).
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:12:00"
+    conditions:
+      - condition: template
+        value_template: "{{ state_attr('sensor.wws_ubersicht', 'bald_ablaufend') | default([], true) | count > 0 }}"
+    actions:
+      - variables:
+          liste: "{{ state_attr('sensor.wws_ubersicht', 'bald_ablaufend') }}"
+          medi: "{{ liste | selectattr('gruppe', 'eq', 'Medikamente') | list }}"
+          rest: "{{ liste | rejectattr('gruppe', 'eq', 'Medikamente') | list }}"
+      - if:
+          - condition: template
+            value_template: "{{ rest | count > 0 }}"
+        then:
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data:
+              chat_id: !secret wws_telegram_chat_id
+              config_entry_id: !secret wws_telegram_config_entry_id
+              parse_mode: html
+              message: |-
+                {{ '🧪 Test · ' if is_state('input_boolean.wws_testmodus', 'on') else '' }}🤖 Guten Morgen, Master. Diese offenen Packungen sollten bald weg:
+                {% for x in rest %}• <b>{{ x.n }}</b> · {{ x.ort }} · offen seit {{ as_datetime(x.seit).strftime('%d.%m.') }}, haltbar bis {{ as_datetime(x.ablauf).strftime('%d.%m.') }}
+                {% endfor %}
+      - if:
+          - condition: template
+            value_template: "{{ medi | count > 0 }}"
+        then:
+          - action: notify.mobile_app_DEIN_HANDY
+            data:
+              title: 💊 Medikamente
+              message: "{% for x in medi %}{{ x.n }} (offen seit {{ as_datetime(x.seit).strftime('%d.%m.') }}) läuft ab. {% endfor %}"
+
+  - id: wws_scan_sitzung_ende
+    alias: "WWS – Scan-Sitzung abgelaufen"
+    description: Nach 10 Minuten ohne Scan – Modus zurück auf Entnehmen, Lagerort leeren.
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: timer.finished
+        event_data:
+          entity_id: timer.wws_scan_sitzung
+    actions:
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.wws_scan_modus
+        data:
+          option: entnehmen
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.wws_scan_lagerort
+        data:
+          value: ""
+
+  - id: wws_telegram_artikel
+    alias: "WWS – Telegram /artikel (neuen Artikel anlegen)"
+    description: >-
+      Antwort auf die Nachfrage zu einem unbekannten Barcode:
+      /artikel <EAN> Name – Marke. Legt den Artikel im Artikelstamm an (Lagerort
+      Eingang, Notiz prüfen), lädt die Stammdaten neu und benennt die Bestandszeile
+      im Eingang um.
+    mode: queued
+    max: 10
+    variables:
+      chat: !secret wws_telegram_chat_id
+    triggers:
+      - trigger: event
+        event_type: telegram_command
+        event_data:
+          command: /artikel
+    conditions:
+      - condition: template
+        value_template: "{{ (trigger.event.data.chat_id | int(0)) == (chat | int(0)) and (trigger.event.data.args | default([]) | count) >= 2 }}"
+    actions:
+      - variables:
+          k: >-
+            {% set args = trigger.event.data.args %}{% set rest = args[1:] | join(' ') %}{% set teile = rest.replace(' - ', ' – ').split(' – ') %}{{ {'c': args[0] | string | trim, 'name': teile[0] | trim, 'marke': (teile[1] | trim) if teile | count > 1 else ''} }}
+      - action: shell_command.wws_senden
+        continue_on_error: true
+        data:
+          daten: "{{ {'action': 'artikel_neu', 'code': k.c, 'name': k.name, 'marke': k.marke, 'lagerort': 'Eingang', 'notiz': 'per Telegram angelegt – prüfen'} }}"
+        response_variable: antwort
+      - event: wws_stammdaten_laden
+      - wait_template: "{{ k.c in (state_attr('sensor.wws_stammdaten', 'artikel') or {}) }}"
+        timeout: "00:01:30"
+        continue_on_timeout: true
+      - action: script.wws_bestand_setzen
+        continue_on_error: true
+        data:
+          code: "{{ k.c }}"
+          ort: Eingang
+          delta_stk: 0
+      - action: telegram_bot.send_message
+        data:
+          chat_id: !secret wws_telegram_chat_id
+          config_entry_id: !secret wws_telegram_config_entry_id
+          parse_mode: html
+          message: >-
+            {% if '"ok"' in (antwort.stdout | default('')) or '"exists"' in (antwort.stdout | default('')) %}🤖 Sehr wohl, Master. <b>{{ k.name }}</b>{{ ' – ' ~ k.marke if k.marke else '' }} ist jetzt bekannt (<code>{{ k.c }}</code>). Er liegt im Eingang – bei Gelegenheit bitte Warengruppe, Lagerort und Mindestbestand in der Tabelle prüfen.{% else %}🤖 Verzeihung, Master – die Tabelle hat nicht geantwortet. Ich versuche es beim nächsten Mal erneut.{% endif %}
+
+  - id: wws_telegram_wo
+    alias: "WWS – Telegram /wo (Bestand suchen)"
+    description: >-
+      /wo <Begriff> sucht im Bestand (Name, Marke, Sammelartikel) und antwortet mit
+      Menge und Lagerort. /wo <Lagerort> (z. B. /wo kühl) listet den Inhalt eines
+      Lagerorts, /wo allein gibt eine Übersicht je Lagerort.
+    mode: queued
+    max: 10
+    variables:
+      chat: !secret wws_telegram_chat_id
+    triggers:
+      - trigger: event
+        event_type: telegram_command
+        event_data:
+          command: /wo
+    conditions:
+      - condition: template
+        value_template: "{{ (trigger.event.data.chat_id | int(0)) == (chat | int(0)) }}"
+    actions:
+      - action: todo.get_items
+        target:
+          entity_id: todo.warenwirtschaft_bestand
+        data:
+          status: needs_action
+        response_variable: liste
+      - variables:
+          q: "{{ (trigger.event.data.args | default([])) | join(' ') | lower | trim }}"
+          zeilen: >-
+            {% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set ns = namespace(z=[]) %}{% for it in liste['todo.warenwirtschaft_bestand']['items'] %}{% set d = (it.description or '{}') | from_json(default={}) %}{% if d.code is defined %}{% set c = d.code | string %}{% set v = a.get(c) or ['Unbekannt (' ~ c ~ ')', '', '', 0, 0, 0, ''] %}{% set ns.z = ns.z + [{'name': v[0], 'marke': v[1], 'such': (v[0] ~ ' ' ~ v[1] ~ ' ' ~ v[6] ~ ' ' ~ c) | lower, 'ort': d.ort | default(''), 'stk': d.stk | int(0), 'offen': d.offen | int(0)}] %}{% endif %}{% endfor %}{{ ns.z | sort(attribute='name') }}
+      - variables:
+          antwort: |-
+            {% macro z(x, mit_ort) %}• {{ x.stk }}× {{ x.name }}{{ ' – ' ~ x.marke if x.marke else '' }}{{ ' (+' ~ x.offen ~ ' offen)' if x.offen > 0 else '' }}{{ ' · ' ~ x.ort if mit_ort else '' }}
+            {% endmacro %}{% set orte = zeilen | map(attribute='ort') | unique | sort | list %}{% set on = namespace(l=[]) %}{% for o in orte if q and (o | lower).startswith(q) %}{% set on.l = on.l + [o] %}{% endfor %}{% set ort_treffer = on.l %}{% if not q %}🤖 Master, der Bestand im Überblick:
+            {% for o in orte %}{% set r = zeilen | selectattr('ort', 'eq', o) | list %}📦 {{ o }}: {{ r | count }} Artikel, {{ r | sum(attribute='stk') }} Stück
+            {% else %}Noch nichts gezählt.
+            {% endfor %}Suchen: /wo senf · Lagerort zeigen: /wo kühlschrank{% elif ort_treffer %}{% for o in ort_treffer %}{% set r = zeilen | selectattr('ort', 'eq', o) | list %}🤖 Master, im {{ o }} liegt:
+            {% for x in r %}{{ z(x, false) }}{% endfor %}{% endfor %}{% else %}{% set w = q.split(' ') | reject('eq', '') | list %}{% set ns = namespace(t=[]) %}{% for x in zeilen %}{% if w | select('in', x.such) | list | count == w | count %}{% set ns.t = ns.t + [x] %}{% endif %}{% endfor %}{% if ns.t %}🤖 Master, „{{ q }}“ haben wir:
+            {% for x in ns.t %}{{ z(x, true) }}{% endfor %}{% else %}{% set a = state_attr('sensor.wws_stammdaten', 'artikel') or {} %}{% set bn = namespace(b=false) %}{% for val in a.values() if q in (val | join(' ') | lower) %}{% set bn.b = true %}{% endfor %}🤖 Verzeihung, Master – „{{ q }}“ {{ 'kenne ich zwar, aber es ist gerade nicht vorrätig (oder noch nicht gezählt).' if bn.b else 'führe ich nicht im Bestand.' }}{% endif %}{% endif %}
+      - action: telegram_bot.send_message
+        data:
+          chat_id: !secret wws_telegram_chat_id
+          config_entry_id: !secret wws_telegram_config_entry_id
+          parse_mode: plain_text
+          message: "{{ antwort[:4000] }}"
+
+  - id: wws_nfc
+    alias: "WWS – NFC-Tags (Lagerort / Müll / Inventur)"
+    description: >-
+      NFC-Tag mit ID wws-lo-… setzt den Lagerort, wws-cmd-… den Modus der
+      Scan-Sitzung (10 Min.). Danach kommt ein Push, der mit einem Tipp den
+      iOS-Kurzbefehl „WWS Scannen“ startet.
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: tag_scanned
+    conditions:
+      - condition: template
+        value_template: "{{ (trigger.event.data.tag_id | default('')).startswith('wws-') }}"
+    actions:
+      - variables:
+          code: "{{ trigger.event.data.tag_id[4:] | upper }}"
+      - action: script.wws_scan
+        data:
+          code: "{{ code }}"
+          quelle: nfc
+        response_variable: r
+      - action: notify.mobile_app_DEIN_HANDY
+        data:
+          title: 🤖 JARVIS – Warenwirtschaft
+          message: "{{ r.text | default('Bereit') }}. Modus {{ states('input_select.wws_scan_modus') }}{{ ', Lagerort ' ~ states('input_text.wws_scan_lagerort') if states('input_text.wws_scan_lagerort') else '' }} – tippen zum Scannen."
+          data:
+            tag: wws_nfc
+            url: shortcuts://run-shortcut?name=WWS%20Scannen
+            push:
+              interruption-level: time-sensitive
